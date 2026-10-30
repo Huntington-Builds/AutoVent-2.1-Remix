@@ -1,0 +1,1963 @@
+/*
+ * SUNLU AMS Heater Auto-Vent Controller
+ *
+ * Automated vent control system for 3D printer filament dryers based on current monitoring.
+ * Detects heater and fan operation via AC current sensing and automatically controls a
+ * servo-operated vent to manage humidity and heat dissipation.
+ *
+ * Features:
+ * - Automatic current-based heater/fan detection
+ * - Servo-controlled vent with position feedback
+ * - Self-learning threshold calibration mode
+ * - EEPROM storage for learned parameters
+ * - LED status indication
+ * - Button-based user interface
+ * - 3-minute fan cooldown delay
+ *
+ * Hardware:
+ * - Board: Seeed XIAO SAMD21 OR Seeed XIAO RP2040 (auto-detected)
+ *   - SAMD21: 3.3V, 48MHz ARM Cortex-M0+, 256KB Flash, 32KB SRAM
+ *   - RP2040: 3.3V, 133MHz Dual ARM Cortex-M0+, 2MB Flash, 264KB SRAM
+ * - Current Sensor: ACS758 LCB-050B (AC current, 40mV/A sensitivity)
+ * - ADC: ADS1115 16-bit I2C ADC (±4.096V range)
+ * - Servo: Feedback-enabled servo motor
+ * - LED: Status indicator (active high, 220Ohm series to GND)
+ * - Button: Momentary push button (active low, internal pullup)
+ *
+ * Pin Configuration (identical physical pins on both boards):
+ * - D0: Servo PWM output
+ * - D3: Button input (active low, internal pullup)
+ * - D10: Status LED (active high, 220Ohm series to GND)
+ * - SDA/SCL: I2C bus for ADS1115
+ *
+ * ADS1115 Channel Mapping:
+ * - A0: ACS758 current sensor output
+ * - A1: Servo position feedback
+ *
+ * License: MIT
+ * Version: See FIRMWARE_VERSION below
+ */
+
+// Firmware Version (Semantic Versioning)
+#define FIRMWARE_VERSION "2.2.1-v4"
+#define FIRMWARE_DATE __DATE__
+#define FIRMWARE_TIME __TIME__
+
+// Hardware Version Selection
+// Version 1: Servo open at 10°, closed at 170° (original kit)
+// Version 2: Servo open at 0°, closed at 180° (original kit)
+// Version 4: AutoVent 2.1 rotating cover (107T sector gear on the 24T servo gear).
+//            ~94° of servo travel, endpoints in microseconds, trimmable and saved to flash.
+//
+// v4 CHANGES (servo layer only - heater/fan detection, thresholds, learning mode,
+// 3-minute fan delay, standby and button behavior are unchanged from the original):
+//  - Servo pulses are limited to the FS90 rating (900-2100 us). Nothing outside is ever sent.
+//  - Open/closed are pulse widths (us), defaulting to +/-470 us around 1500 us.
+//  - Moves ramp to the target, settle, then detach (no holding torque, like the original).
+//  - Calibration and recalibration move only between the configured endpoints
+//    (the original drove to 0/180 deg, which stalled against the mechanism).
+//  - After each move the feedback wire is checked; a miss is reported as a possible bind.
+//  - New serial commands: M (mid), [ ] (trim OPEN), { } (trim CLOSED), X (swap),
+//    W (save endpoints), P (print servo settings), A (self-calibrate), H or ? (help).
+//  - Self-calibrating setup (no computer needed): hold the button while plugging in power,
+//    or first boot with no saved endpoints. The servo parks at mid for gear installation,
+//    finds both slot stops with the feedback wire, sets OPEN/CLOSED 2 deg of cover travel
+//    inside each stop, asks you to confirm which end is open, and saves.
+#define HARDWARE_VERSION 4
+
+// Board detection and conditional compilation
+#if defined(ARDUINO_ARCH_SAMD)
+  #define BOARD_SAMD21
+  #include <FlashStorage.h>  // SAMD21 EEPROM emulation
+  #define MY_BOARD_NAME "SAMD21"
+#elif defined(ARDUINO_ARCH_RP2040)
+  #define BOARD_RP2040
+  #include <EEPROM.h>  // RP2040 EEPROM emulation
+  #include <hardware/gpio.h>
+  #include <hardware/pwm.h>
+  #define MY_BOARD_NAME "RP2040"
+#else
+  #error "Unsupported board! This code requires Seeed XIAO SAMD21 or RP2040"
+#endif
+
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <Servo.h>
+#include <math.h>
+
+#ifdef BOARD_RP2040
+  #include <Adafruit_NeoPixel.h>
+#endif
+
+// ----------------- Pin Definitions -----------------
+// RP2040 requires D prefix, SAMD21 uses numeric pins
+// Both boards have identical physical pinout on XIAO form factor
+#ifdef BOARD_RP2040
+  #define SERVO_PWM_PIN    D0   // Servo PWM output (GPIO26)
+  #define LED_PIN          D10  // Status LED (GPIO3)
+  #define BUTTON_PIN       D3   // Button input (GPIO29)
+  // GPIO numbers for RP2040 hardware control
+  #define GPIO_SERVO       26   // D0 = GPIO26
+  #define GPIO_LED         3    // D10 = GPIO3
+  #define GPIO_BTN         29   // D3 = GPIO29
+#else  // SAMD21
+  #define SERVO_PWM_PIN    0    // Servo PWM output
+  #define LED_PIN          10   // Status LED
+  #define BUTTON_PIN       3    // Button input
+#endif
+
+// ----------------- Constants -----------------
+#define ADS_CH_CURRENT   0   // ACS758 -> ADS A0
+#define ADS_CH_SERVO_FB  1   // Servo feedback -> ADS A1
+
+static const float ADS_LSB_V     = 0.000125f;   // ADS1115 @ GAIN_ONE (±4.096V range)
+static const float SENS_V_PER_A  = 0.040f;      // ACS758 LCB-050B @ 5V ≈ 40 mV/A
+static const uint32_t SAMPLE_MS  = 500;         // Sample for 500ms (~30 AC cycles @ 60Hz)
+static const uint32_t OFFSET_MEASURE_MS = 5000; // 5 seconds to measure offset at startup
+static const uint32_t ROLLING_AVG_MS = 30000;   // 30 second rolling average window
+static const uint8_t MAX_SAMPLES = 60;          // Store 60 samples (30 seconds at 0.5s per sample)
+
+// Detection thresholds - Can be learned or set manually
+// These defaults will be used if no learned values are stored in EEPROM
+static float HEATER_ON_THRESHOLD  = 0.200f;  // Above this = heater on (200mA)
+static float HEATER_OFF_THRESHOLD = 0.120f;  // Below this = heater off (120mA)
+static float FAN_ON_THRESHOLD     = 0.025f;  // Above this = fan on (25mA, above baseline ~13mA)
+static float FAN_OFF_THRESHOLD    = 0.020f;  // Below this = fan off (20mA, with hysteresis)
+
+// Simple activity detection - anything running vs completely idle
+// This is what you'll likely use for actual vent control
+static const float ACTIVITY_THRESHOLD    = 0.100f;  // Above this = something is running (100mA)
+static const float IDLE_THRESHOLD        = 0.080f;  // Below this = completely idle (80mA)
+
+// ----------------- ACS758 Self-Test Configuration -----------------
+// The ACS758 is a ratiometric sensor: with no current flowing, a BIDIRECTIONAL
+// variant parks its output at Vcc/2. At the 5V sensor supply that is ~2.500V.
+// The ADS1115 runs off 3.3V, so anything it reads clamps near 3.3V regardless
+// of the +/-4.096V GAIN_ONE full scale.
+//
+// NOTE: verify ACS_VQ_NOMINAL against a real board before trusting the PASS
+// window - if this sensor is a UNIdirectional variant the quiescent point is
+// ~0.12*Vcc (~0.6V) instead, and every reading below will look like a fault.
+static const float ACS_VCC_NOMINAL   = 5.000f;                    // ACS758 supply rail
+static const float ACS_VQ_NOMINAL    = ACS_VCC_NOMINAL * 0.5f;    // Expected idle output (bidirectional)
+static const float ACS_VQ_TOL        = 0.350f;  // +/- window around Vq counted as healthy
+static const float ACS_V_DEAD_LOW    = 0.200f;  // Below this = dead short / no signal
+static const float ACS_V_RAIL_HIGH   = 3.200f;  // Above this = pinned at the ADS 3.3V rail
+static const float ACS_V_IMPOSSIBLE   = 1.000f;  // |mean-Vq| beyond this cannot be a healthy sensor
+static const float ACS_NOISE_MAX_V   = 0.050f;  // Idle pk-pk above this = noisy or live load
+static const float ACS_FLOAT_DRAG_V  = 0.030f;  // Mux settling drag that implies a high-Z pin
+static const float ACS_FLOAT_MIN_SEP = 0.500f;  // Min A1-vs-A0 separation for the drag test
+static const uint8_t ACS_TEST_SAMPLES = 64;     // Samples used for the DC/noise measurement
+
+// Self-test verdicts, worst-first
+enum AcsTestResult {
+  ACS_PASS = 0,
+  ACS_WARN_NOISY,
+  ACS_WARN_OFF_NOMINAL,
+  ACS_FAIL_FLOATING,
+  ACS_FAIL_BIAS,
+  ACS_FAIL_LOW,
+  ACS_FAIL_HIGH
+};
+
+AcsTestResult g_acsTestResult = ACS_PASS;
+
+// ----------------- Servo endpoints (microseconds) -----------------
+// FS90 / FS90-FB rating: 900-2100 us for ~120 deg (~10 us per deg)
+static const int SERVO_US_MIN = 900;
+static const int SERVO_US_MAX = 2100;
+static const int SERVO_US_MID = 1500;
+#if HARDWARE_VERSION == 4
+  // Cover turns 21 deg open->closed = ~94 deg at the servo (107/24 ratio).
+  // The cover's slot stops allow ~+/-55 deg around mid, so these defaults leave
+  // ~8 deg of margin each side when the gear is installed with the servo at mid (M).
+  static const int DEFAULT_OPEN_US   = 1030;
+  static const int DEFAULT_CLOSED_US = 1970;
+#elif HARDWARE_VERSION == 2
+  static const int DEFAULT_OPEN_US   = 1000;   // what the original sent for 0 deg
+  static const int DEFAULT_CLOSED_US = 2000;   // what the original sent for 180 deg
+#else
+  static const int DEFAULT_OPEN_US   = 1056;   // 10 deg
+  static const int DEFAULT_CLOSED_US = 1944;   // 170 deg
+#endif
+static int g_openUs   = DEFAULT_OPEN_US;
+static int g_closedUs = DEFAULT_CLOSED_US;
+static int g_lastUs   = -1;                      // last commanded pulse, -1 = unknown
+static bool g_fbValid = false;                   // feedback calibrated for current endpoints
+static const int SERVO_TRIM_STEP_US      = 10;   // [ ] { } trim step
+static const int SERVO_MANUAL_MARGIN_US  = 100;  // manual moves may go this far past the endpoints
+static const int SERVO_RAMP_STEP_US      = 25;
+static const uint32_t SERVO_RAMP_STEP_MS = 15;   // 25 us / 15 ms -> full 940 us travel in ~0.6 s
+static const uint32_t SERVO_SETTLE_MS    = 400;
+
+// Feedback calibration values (Adafruit method)
+// These map feedback readings to servo positions
+static float g_minFeedback = 0.0f;   // Feedback at closed position
+static float g_maxFeedback = 1.0f;   // Feedback at open position
+
+// ----------------- Globals -----------------
+Adafruit_ADS1115 ads;
+Servo servo;
+
+// Offset tracking
+float g_voltageOffset = 0.0f;
+
+// Rolling average circular buffer
+float g_currentSamples[MAX_SAMPLES];
+uint8_t g_sampleIndex = 0;
+uint8_t g_sampleCount = 0;
+uint32_t g_lastUpdateMs = 0;
+uint32_t g_lastDebugOutputMs = 0;  // Timer for debug output throttling
+
+// Vent control state
+bool g_ventOpen = false;
+bool g_heaterWasOn = false;
+uint32_t g_ventCloseDelayStart = 0;
+bool g_ventClosePending = false;
+static const uint32_t VENT_CLOSE_DELAY_MS = 180000;  // 3 minute delay before closing
+
+// Device state detection (global so they can be reset during calibration)
+bool g_fanOn = false;
+bool g_heaterOn = false;
+bool g_systemActive = false;
+
+// Serial input buffer for numeric commands
+char g_serialBuffer[8];
+uint8_t g_serialIdx = 0;
+
+// Calibration and LED state
+bool g_calibrated = false;
+uint32_t g_lastLedToggle = 0;
+bool g_ledState = false;
+static const uint32_t LED_FLASH_INTERVAL = 250;  // Flash every 250ms during calibration
+
+// Built-in LED breathing effect (RP2040 only)
+#ifdef BOARD_RP2040
+  uint32_t g_breathingStartMs = 0;
+  static const uint32_t BREATHING_PERIOD_MS = 3000;  // 3 second breathing cycle
+  static const uint8_t BREATHING_MIN = 2;   // Minimum brightness (never fully off)
+  static const uint8_t BREATHING_MAX = 40;  // Maximum brightness (dimmer)
+  static const uint8_t NEOPIXEL_POWER_PIN = 11;  // NeoPixel power pin (must be HIGH)
+  static const uint8_t NEOPIXEL_DATA_PIN = 12;   // NeoPixel data pin (GPIO12 on XIAO RP2040)
+  static const uint8_t NEOPIXEL_COUNT = 1;       // One NeoPixel LED
+  Adafruit_NeoPixel neopixel(NEOPIXEL_COUNT, NEOPIXEL_DATA_PIN, NEO_GRB + NEO_KHZ800);
+#endif
+
+// Button state for edge detection and long press
+bool g_lastButtonState = HIGH;
+uint32_t g_buttonPressStart = 0;
+bool g_buttonHandled = false;
+bool g_ignoreNextRelease = false;  // Flag to ignore button release after entering learning mode
+bool g_bootButtonHeld = false;     // Button held while power was applied -> servo self-calibration
+static const uint32_t LONG_PRESS_MS = 2000;   // 2 second long press
+static const uint32_t VLONG_PRESS_MS = 5000;  // 5 second very long press for learning mode
+
+// System power state (standby mode)
+bool g_systemOn = true;
+
+// Learning mode state
+enum LearningPhase {
+  LEARN_NONE = 0,
+  LEARN_BASELINE,
+  LEARN_HEATER,
+  LEARN_FAN_ONLY,
+  LEARN_COMPLETE
+};
+LearningPhase g_learningPhase = LEARN_NONE;
+float g_learnedBaseline = 0.0f;
+float g_learnedHeater = 0.0f;
+float g_learnedFanOnly = 0.0f;
+uint32_t g_learningStartMs = 0;  // When measurement started (0 = in prep phase)
+uint32_t g_learningPhaseEntryMs = 0;  // When phase was entered
+static const uint32_t LEARNING_MEASURE_MS = 10000;  // 10 seconds per phase
+static const uint32_t LEARNING_PREP_MS = 5000;  // 5 seconds prep time before auto-start
+
+// LED patterns
+enum LEDPattern {
+  LED_SOLID,
+  LED_FAST_FLASH,      // 100ms - learning mode active
+  LED_SLOW_FLASH,      // 250ms - calibration
+  LED_DOUBLE_BLINK,    // Double blink pattern
+  LED_BREATHING,       // Slow breathing pattern
+  LED_SUCCESS_BLINK,   // 2 quick flashes
+  LED_COMPLETE_BLINK,  // 3 long flashes
+  LED_OFF
+};
+LEDPattern g_ledPattern = LED_SOLID;
+uint32_t g_ledPatternStart = 0;
+
+// EEPROM structure for storing learned thresholds
+struct ThresholdData {
+  uint32_t magic;  // Magic number to verify valid data
+  float fanOnThreshold;
+  float fanOffThreshold;
+  float heaterOnThreshold;
+  float heaterOffThreshold;
+};
+static const uint32_t EEPROM_MAGIC = 0xABCD1234;
+
+// Servo endpoints are stored separately so learned thresholds at address 0 are untouched
+struct ServoData {
+  uint32_t magic;
+  int16_t openUs;
+  int16_t closedUs;
+};
+static const uint32_t SERVO_MAGIC = 0x5E4F0004;
+static const int SERVO_EEPROM_ADDR = 64;
+
+#ifdef BOARD_SAMD21
+  FlashStorage(thresholdStorage, ThresholdData);
+  FlashStorage(servoStorage, ServoData);
+#endif
+
+// ----------------- Helper Functions -----------------
+
+#ifdef BOARD_RP2040
+// Update built-in NeoPixel with smooth breathing effect (RP2040 only)
+// Uses NeoPixel library for WS2812B RGB LED control
+// Color changes based on heater state: RED = heater on, BLUE = heater off
+void updateBuiltinLEDBreathing() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - g_breathingStartMs;
+  uint32_t phase = elapsed % BREATHING_PERIOD_MS;
+
+  // Calculate brightness using sine wave approximation
+  // Phase goes from 0 to BREATHING_PERIOD_MS
+  float t = (float)phase / (float)BREATHING_PERIOD_MS;  // 0.0 to 1.0
+
+  // Use sine wave: sin(2*PI*t) ranges from -1 to 1
+  // Convert to 0 to 1: (sin(2*PI*t) + 1) / 2
+  float angle = t * 2.0f * 3.14159f;
+  float brightness = (sin(angle) + 1.0f) / 2.0f;
+
+  // Map to brightness range with minimum brightness
+  uint8_t brightnessValue = BREATHING_MIN + (uint8_t)(brightness * (BREATHING_MAX - BREATHING_MIN));
+
+  // Seeed XIAO RP2040: NeoPixel on pin 12 (data), pin 11 (power)
+  // Color based on heater state: RED = heater on, BLUE = heater off
+  if (g_heaterOn) {
+    // Red when heater is on
+    neopixel.setPixelColor(0, neopixel.Color(brightnessValue, 0, 0));
+  } else {
+    // Blue when heater is off
+    neopixel.setPixelColor(0, neopixel.Color(0, 0, brightnessValue));
+  }
+  neopixel.show();
+}
+#endif
+
+// LED pattern handler - call this frequently from loop()
+void updateLEDPattern() {
+  uint32_t now = millis();
+  uint32_t elapsed = now - g_ledPatternStart;
+
+  switch (g_ledPattern) {
+    case LED_SOLID:
+      digitalWrite(LED_PIN, HIGH);
+      #ifdef BOARD_SAMD21
+        digitalWrite(LED_BUILTIN, HIGH);
+      #endif
+      break;
+
+    case LED_FAST_FLASH:  // 100ms on/off for learning mode
+      if (now - g_lastLedToggle >= 100) {
+        g_ledState = !g_ledState;
+        digitalWrite(LED_PIN, g_ledState);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, g_ledState);
+        #endif
+        g_lastLedToggle = now;
+      }
+      break;
+
+    case LED_SLOW_FLASH:  // 250ms on/off for calibration
+      if (now - g_lastLedToggle >= 250) {
+        g_ledState = !g_ledState;
+        digitalWrite(LED_PIN, g_ledState);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, g_ledState);
+        #endif
+        g_lastLedToggle = now;
+      }
+      break;
+
+    case LED_DOUBLE_BLINK:  // Double blink every 2 seconds
+      if (elapsed < 150) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 300) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else if (elapsed < 450) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 2000) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else {
+        g_ledPatternStart = now;
+      }
+      break;
+
+    case LED_BREATHING:  // Slow breathing pattern using PWM
+      {
+        // Simple approximation using on/off timing
+        uint32_t cycle = elapsed % 2000;
+        if (cycle < 1000) {
+          // Fade in - use simple threshold
+          digitalWrite(LED_PIN, cycle > 500 ? HIGH : (cycle % 100 < 50 ? HIGH : LOW));
+          #ifdef BOARD_SAMD21
+            digitalWrite(LED_BUILTIN, cycle > 500 ? HIGH : (cycle % 100 < 50 ? HIGH : LOW));
+          #endif
+        } else {
+          // Fade out
+          uint32_t fadeOut = cycle - 1000;
+          digitalWrite(LED_PIN, fadeOut < 500 ? HIGH : (fadeOut % 100 < 50 ? HIGH : LOW));
+          #ifdef BOARD_SAMD21
+            digitalWrite(LED_BUILTIN, fadeOut < 500 ? HIGH : (fadeOut % 100 < 50 ? HIGH : LOW));
+          #endif
+        }
+      }
+      break;
+
+    case LED_SUCCESS_BLINK:  // 2 quick flashes then return to solid
+      if (elapsed < 150) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 300) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else if (elapsed < 450) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 600) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else {
+        g_ledPattern = LED_SOLID;
+      }
+      break;
+
+    case LED_COMPLETE_BLINK:  // 3 long flashes then return to solid
+      if (elapsed < 500) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 1000) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else if (elapsed < 1500) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 2000) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else if (elapsed < 2500) {
+        digitalWrite(LED_PIN, HIGH);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, HIGH);
+        #endif
+      } else if (elapsed < 3000) {
+        digitalWrite(LED_PIN, LOW);
+        #ifdef BOARD_SAMD21
+          digitalWrite(LED_BUILTIN, LOW);
+        #endif
+      } else {
+        g_ledPattern = LED_SOLID;
+      }
+      break;
+
+    case LED_OFF:
+      digitalWrite(LED_PIN, LOW);
+      #ifdef BOARD_SAMD21
+        digitalWrite(LED_BUILTIN, LOW);
+      #endif
+      break;
+  }
+}
+
+// Set LED pattern
+void setLEDPattern(LEDPattern pattern) {
+  g_ledPattern = pattern;
+  g_ledPatternStart = millis();
+  g_lastLedToggle = millis();
+}
+
+// Delay while flashing LED (for calibration)
+void delayWithFlashing(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    if (millis() - g_lastLedToggle >= LED_FLASH_INTERVAL) {
+      g_ledState = !g_ledState;
+      digitalWrite(LED_PIN, g_ledState);
+      g_lastLedToggle = millis();
+    }
+  }
+}
+
+inline float readVolts(uint8_t ch) {
+  int16_t raw = ads.readADC_SingleEnded(ch);
+  return raw * ADS_LSB_V;
+}
+
+// Median filter for servo feedback (reduce noise)
+static inline float median3(float a, float b, float c) {
+  float x = a, y = b, z = c;
+  if (x > y) { float t = x; x = y; y = t; }
+  if (y > z) { float t = y; y = z; z = t; }
+  if (x > y) { float t = x; x = y; y = t; }
+  return y;
+}
+
+// Read servo feedback position (0.0 to 1.0)
+float readServoFeedback01() {
+  float v1 = readVolts(ADS_CH_SERVO_FB);
+  float v2 = readVolts(ADS_CH_SERVO_FB);
+  float v3 = readVolts(ADS_CH_SERVO_FB);
+  float v  = median3(v1, v2, v3);
+  float x  = v / 3.3f;
+  if (x < 0) x = 0; if (x > 1) x = 1;
+  return x;
+}
+
+// Feedback range between the calibrated endpoints (closed = g_minFeedback, open = g_maxFeedback)
+static float feedbackRange() { return fabsf(g_maxFeedback - g_minFeedback); }
+
+// Expected feedback for a pulse width (linear between the calibrated endpoints)
+float usToFeedback(int us) {
+  float t = (float)(us - g_closedUs) / (float)(g_openUs - g_closedUs);
+  return g_minFeedback + t * (g_maxFeedback - g_minFeedback);
+}
+
+// Estimated pulse width from a feedback reading
+int feedbackToUs(float fb) {
+  if (feedbackRange() < 0.02f) return -1;
+  float t = (fb - g_minFeedback) / (g_maxFeedback - g_minFeedback);
+  return g_closedUs + (int)lroundf(t * (g_openUs - g_closedUs));
+}
+
+// Percent open estimated from a feedback reading (0 = closed, 100 = open)
+int feedbackToPercentOpen(float fb) {
+  if (feedbackRange() < 0.02f) return -1;
+  float t = (fb - g_minFeedback) / (g_maxFeedback - g_minFeedback);
+  return (int)lroundf(t * 100.0f);
+}
+
+// Measure RMS current over a time period using Welford's online algorithm
+float measureIrmsOver(uint32_t ms) {
+  uint32_t t0 = millis();
+  double mean = 0.0, M2 = 0.0;
+  uint32_t n = 0;
+
+  while ((millis() - t0) < ms) {
+    float v = readVolts(ADS_CH_CURRENT) - g_voltageOffset;  // Apply offset correction
+    n++;
+    double d  = v - mean;
+    mean     += d / n;
+    double d2 = v - mean;
+    M2       += d * d2;
+  }
+
+  if (n < 2) return 0.0f;
+
+  double var = M2 / (n - 1);
+  double vrms_ac = sqrt(fmax(0.0, var));
+
+  return (float)(vrms_ac / SENS_V_PER_A);
+}
+
+// Calculate voltage offset by averaging readings over a period
+float calculateOffset(uint32_t ms) {
+  uint32_t t0 = millis();
+  double sum = 0.0;
+  uint32_t n = 0;
+
+  Serial.println(F("Measuring voltage offset (ensure no load on ACS758)..."));
+
+  while ((millis() - t0) < ms) {
+    float v = readVolts(ADS_CH_CURRENT);
+    sum += v;
+    n++;
+
+    // Flash LED during offset measurement
+    if (millis() - g_lastLedToggle >= LED_FLASH_INTERVAL) {
+      g_ledState = !g_ledState;
+      digitalWrite(LED_PIN, g_ledState);
+      g_lastLedToggle = millis();
+    }
+
+    // Print progress every 500ms
+    if (n % 50 == 0) {
+      Serial.print(F("."));
+    }
+  }
+
+  Serial.println();
+
+  if (n == 0) return 0.0f;
+
+  float offset = (float)(sum / n);
+  Serial.print(F("Offset calculated: "));
+  Serial.print(offset, 6);
+  Serial.print(F("V from "));
+  Serial.print(n);
+  Serial.println(F(" samples"));
+
+  return offset;
+}
+
+// ----------------- ACS758 / PCB Connectivity Self-Test -----------------
+//
+// Checks that the current sensor is actually wired to ADS1115 A0 and alive,
+// without needing any load current. Three independent checks:
+//
+//   1. DC bias    - an idle bidirectional ACS758 sits at Vcc/2 (~2.5V). Near 0V
+//                   means no signal (unpowered sensor, open VOUT trace, or VOUT
+//                   shorted to GND). Near the 3.3V rail means VOUT is shorted
+//                   high or the ADS input is clamping.
+//   2. Mux drag   - the ADS1115 multiplexes one sampling capacitor across all
+//                   four inputs. Charge it up on A1 (servo feedback), then read
+//                   A0 immediately: a low-impedance driven pin pulls the cap to
+//                   its own voltage in the first conversion, while a FLOATING
+//                   pin lets the residual A1 charge dominate and then drifts
+//                   over the next few reads. A large first-read-vs-settled
+//                   delta means A0 is not actually connected to anything.
+//   3. Noise floor- a healthy idle sensor is quiet (a few mV pk-pk). A large
+//                   spread means either real load current (dryer powered on) or
+//                   a floating/noise-coupled input.
+//
+// CAUTION: check 2 is a heuristic, not a datasheet-guaranteed behavior, AND on
+// the current PCB it is expected to be DEAD CODE: C4 (.1uF) sits on the A0 net
+// at the ADS side of R5, so A0 is never high-impedance from the ADC's point of
+// view and the sampling cap always finds charge locally. Check 1 is what
+// actually catches a disconnected sensor here - with the sensor unplugged, C4
+// has nothing to charge it and A0 sits near 0V, tripping ACS_FAIL_LOW.
+// Check 2 is retained only for a future board that drops C4. Validate it on the
+// bench before trusting it; ACS_FLOAT_DRAG_V is the knob to tune.
+//
+// PCB CONTEXT (from AutoVent_KiCad/SAMD21 Schematic.kicad_sch):
+//   J4 "ACS_Conn" = UNKEYED 1x03 2.54mm header - pin1 +5V, pin2 GND, pin3 VOUT
+//   VOUT -> R5 (1k series) -> A0 -> C4 (.1uF to GND) -> J3 ADS1115 breakout
+//   R5 limits back-drive into the ADC to ~1.4mA if J4 is reversed.
+//
+AcsTestResult runAcsSelfTest(bool verbose) {
+  if (verbose) {
+    Serial.println(F("\n--- ACS758 CONNECTIVITY SELF-TEST ---"));
+  }
+
+  // --- Check 1 + 3: DC bias and noise floor on A0 ---
+  double sum = 0.0;
+  float vMin = 1e6f, vMax = -1e6f;
+  for (uint8_t i = 0; i < ACS_TEST_SAMPLES; i++) {
+    float v = readVolts(ADS_CH_CURRENT);
+    sum += v;
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+  }
+  float vMean = (float)(sum / ACS_TEST_SAMPLES);
+  float vPkPk = vMax - vMin;
+
+  // --- Check 2: mux settling drag (floating-input detector) ---
+  // Park the ADS sampling cap on A1, then watch how A0 behaves on the very
+  // first conversion versus after it has had several conversions to settle.
+  float vRef = 0.0f;
+  for (uint8_t i = 0; i < 4; i++) vRef = readVolts(ADS_CH_SERVO_FB);
+  float vFirst = readVolts(ADS_CH_CURRENT);
+  float vSettled = 0.0f;
+  for (uint8_t i = 0; i < 8; i++) vSettled = readVolts(ADS_CH_CURRENT);
+  float drag = vFirst - vSettled;
+
+  // The test only means anything if A1 sits far enough away from A0 to pull it.
+  bool dragValid = (fabsf(vRef - vSettled) >= ACS_FLOAT_MIN_SEP);
+  // A floating pin gets dragged TOWARD A1, so require the sign to agree.
+  bool draggedTowardRef = ((vRef > vSettled) && (drag > 0.0f)) ||
+                          ((vRef < vSettled) && (drag < 0.0f));
+  bool floating = dragValid && draggedTowardRef && (fabsf(drag) >= ACS_FLOAT_DRAG_V);
+
+  // --- Verdict, worst fault wins ---
+  AcsTestResult result;
+  if (vMean < ACS_V_DEAD_LOW) {
+    result = ACS_FAIL_LOW;
+  } else if (vMean > ACS_V_RAIL_HIGH) {
+    result = ACS_FAIL_HIGH;
+  } else if (floating) {
+    result = ACS_FAIL_FLOATING;
+  } else if (fabsf(vMean - ACS_VQ_NOMINAL) > ACS_V_IMPOSSIBLE) {
+    // The dryer is an AC load, so its current averages to zero over many cycles
+    // and does NOT move the DC mean. A mean this far from Vq is a wiring fault,
+    // not a measurement - it is safe to call this a hard failure.
+    result = ACS_FAIL_BIAS;
+  } else if (fabsf(vMean - ACS_VQ_NOMINAL) > ACS_VQ_TOL) {
+    result = ACS_WARN_OFF_NOMINAL;
+  } else if (vPkPk > ACS_NOISE_MAX_V) {
+    result = ACS_WARN_NOISY;
+  } else {
+    result = ACS_PASS;
+  }
+
+  if (verbose) {
+    Serial.print(F("  A0 idle bias : "));
+    Serial.print(vMean, 4);
+    Serial.print(F("V (expect "));
+    Serial.print(ACS_VQ_NOMINAL, 3);
+    Serial.print(F("V +/- "));
+    Serial.print(ACS_VQ_TOL, 2);
+    Serial.println(F("V)"));
+
+    Serial.print(F("  Implied Vcc  : "));
+    Serial.print(vMean * 2.0f, 3);
+    Serial.println(F("V   <- sanity-check the 5V sensor rail"));
+
+    Serial.print(F("  Noise pk-pk  : "));
+    Serial.print(vPkPk * 1000.0f, 1);
+    Serial.print(F("mV  (min "));
+    Serial.print(vMin, 4);
+    Serial.print(F("V / max "));
+    Serial.print(vMax, 4);
+    Serial.println(F("V)"));
+
+    Serial.print(F("  Mux drag     : "));
+    if (!dragValid) {
+      Serial.print(F("inconclusive (A1 at "));
+      Serial.print(vRef, 3);
+      Serial.println(F("V is too close to A0)"));
+    } else {
+      Serial.print(drag * 1000.0f, 1);
+      Serial.print(F("mV toward A1@"));
+      Serial.print(vRef, 3);
+      Serial.print(F("V  (trip at "));
+      Serial.print(ACS_FLOAT_DRAG_V * 1000.0f, 0);
+      Serial.println(F("mV)"));
+    }
+
+    Serial.print(F("  RESULT       : "));
+    switch (result) {
+      case ACS_PASS:
+        Serial.println(F("PASS - sensor connected and idle"));
+        break;
+      case ACS_WARN_NOISY:
+        Serial.println(F("WARN - reading is noisy"));
+        Serial.println(F("    Expected if the dryer is powered ON right now."));
+        Serial.println(F("    If the dryer is OFF, suspect a long/unshielded VOUT"));
+        Serial.println(F("    run, a missing filter cap, or ground-loop coupling."));
+        break;
+      case ACS_WARN_OFF_NOMINAL:
+        Serial.println(F("WARN - bias present but off-nominal"));
+        Serial.println(F("    Sensor is connected, but not parked where expected."));
+        Serial.println(F("    Check: 5V rail sagging, a divider on VOUT, DC current"));
+        Serial.println(F("    through the sense conductor, or a UNIdirectional part."));
+        break;
+      case ACS_FAIL_FLOATING:
+        Serial.println(F("FAIL - A0 looks DISCONNECTED (high impedance)"));
+        Serial.println(F("    A0 tracks the neighboring channel instead of holding"));
+        Serial.println(F("    its own voltage. Check the VOUT trace/connector"));
+        Serial.println(F("    between the ACS758 and the ADS1115 A0 pin."));
+        break;
+      case ACS_FAIL_LOW:
+        Serial.println(F("FAIL - A0 is at/near 0V"));
+        Serial.println(F("    No signal reaching the ADC. Check: ACS758 5V supply,"));
+        Serial.println(F("    sensor GND, VOUT shorted to GND, or a solder bridge."));
+        break;
+      case ACS_FAIL_BIAS:
+        Serial.println(F("FAIL - bias present but impossible for a healthy sensor"));
+        Serial.println(F("    An AC load cannot shift the DC mean, so this is a"));
+        Serial.println(F("    wiring fault. SUSPECT #1: J4 plugged in BACKWARDS."));
+        Serial.println(F("    J4 is an unkeyed 3-pin header: 1=+5V 2=GND 3=VOUT."));
+        break;
+      case ACS_FAIL_HIGH:
+        Serial.println(F("FAIL - A0 is pinned at the 3.3V rail"));
+        Serial.println(F("    SUSPECT #1: J4 plugged in BACKWARDS. Reversing an"));
+        Serial.println(F("    unkeyed 3-pin header swaps +5V (pin1) with VOUT"));
+        Serial.println(F("    (pin3), leaving GND on pin2. That un-powers the"));
+        Serial.println(F("    ACS758 and drives +5V into its output pin, which"));
+        Serial.println(F("    back-feeds A0 through the dead chip. UNPLUG NOW -"));
+        Serial.println(F("    R5 protects the ADC, but nothing protects the"));
+        Serial.println(F("    sensor from +5V on its VOUT pin."));
+        Serial.println(F("    Otherwise: VOUT shorted to a rail, or overcurrent."));
+        break;
+    }
+    Serial.println(F("-------------------------------------\n"));
+  }
+
+  return result;
+}
+
+// Add sample to rolling average buffer
+void addSampleToRollingAvg(float current) {
+  g_currentSamples[g_sampleIndex] = current;
+  g_sampleIndex = (g_sampleIndex + 1) % MAX_SAMPLES;
+  if (g_sampleCount < MAX_SAMPLES) {
+    g_sampleCount++;
+  }
+}
+
+// Calculate rolling average from buffer
+float getRollingAverage() {
+  if (g_sampleCount == 0) return 0.0f;
+
+  double sum = 0.0;
+  for (uint8_t i = 0; i < g_sampleCount; i++) {
+    sum += g_currentSamples[i];
+  }
+
+  return (float)(sum / g_sampleCount);
+}
+
+static int clampUs(int us, int lo, int hi) { return us < lo ? lo : (us > hi ? hi : us); }
+
+// Attach with explicit pulse limits so nothing outside the FS90 rating is ever sent
+static void servoAttach() {
+  if (!servo.attached()) {
+    servo.attach(SERVO_PWM_PIN, SERVO_US_MIN, SERVO_US_MAX);
+    delay(20);
+  }
+}
+
+// Ramp to a pulse width, settle, detach. 'flashing' keeps the LED flashing (calibration).
+static void rampTo(int us, bool flashing) {
+  us = clampUs(us, SERVO_US_MIN, SERVO_US_MAX);
+  servoAttach();
+  if (g_lastUs < 0) {
+    servo.writeMicroseconds(us);              // position unknown: go directly (inside the window)
+  } else {
+    int cur = g_lastUs;
+    while (cur != us) {
+      int step = us > cur ? SERVO_RAMP_STEP_US : -SERVO_RAMP_STEP_US;
+      cur = (abs(us - cur) <= SERVO_RAMP_STEP_US) ? us : cur + step;
+      servo.writeMicroseconds(cur);
+      if (flashing) delayWithFlashing(SERVO_RAMP_STEP_MS); else delay(SERVO_RAMP_STEP_MS);
+    }
+  }
+  if (flashing) delayWithFlashing(SERVO_SETTLE_MS); else delay(SERVO_SETTLE_MS);
+  g_lastUs = us;
+}
+
+// Move servo to a pulse width (us), detach, and check the feedback wire
+void moveServoUs(int us) {
+  rampTo(us, false);
+  float fb = readServoFeedback01();
+  servo.detach();
+  Serial.print(F("Servo moved to "));
+  Serial.print(us);
+  Serial.print(F(" us | feedback "));
+  Serial.println(fb, 4);
+
+  // Bind check: only when the feedback is calibrated and the target is between the endpoints
+  int lo = min(g_openUs, g_closedUs), hi = max(g_openUs, g_closedUs);
+  if (g_fbValid && feedbackRange() >= 0.05f && us >= lo && us <= hi) {
+    float err = fabsf(fb - usToFeedback(us));
+    if (err > 0.20f * feedbackRange()) {
+      Serial.print(F("WARNING: servo did not reach target (feedback off by "));
+      Serial.print((int)lroundf(100.0f * err / feedbackRange()));
+      Serial.println(F("% of travel) - check the cover for binding"));
+    }
+  }
+}
+
+// Close vent
+void closeVent() {
+  Serial.println(F("CLOSING VENT"));
+  moveServoUs(g_closedUs);
+}
+
+// Open vent
+void openVent() {
+  Serial.println(F("OPENING VENT"));
+  moveServoUs(g_openUs);
+}
+
+// Read feedback at both endpoints (closed -> open -> closed). Never leaves the endpoints.
+static void calibrateServoFeedback(bool flashing) {
+  Serial.print(F("  CLOSED endpoint: ")); Serial.print(g_closedUs); Serial.println(F(" us"));
+  Serial.print(F("  OPEN endpoint:   ")); Serial.print(g_openUs);   Serial.println(F(" us"));
+  rampTo(g_closedUs, flashing);
+  g_minFeedback = readServoFeedback01();
+  Serial.print(F("  CLOSED feedback: ")); Serial.println(g_minFeedback, 4);
+  rampTo(g_openUs, flashing);
+  g_maxFeedback = readServoFeedback01();
+  Serial.print(F("  OPEN feedback:   ")); Serial.println(g_maxFeedback, 4);
+  rampTo(g_closedUs, flashing);
+  servo.detach();
+  g_fbValid = true;
+  if (feedbackRange() < 0.05f) {
+    Serial.println(F("WARNING: Feedback range too small (feedback wire not connected, or servo not moving)"));
+  }
+}
+
+// Recalibrate servo feedback (R command) - same moves as startup, endpoints only
+void calibrateFromCurrentPosition() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("SERVO RECALIBRATION (endpoints only)"));
+  Serial.println(F("========================================"));
+  calibrateServoFeedback(false);
+  Serial.println(F("========================================\n"));
+}
+
+// Load / save servo endpoints (separate record from the learned thresholds)
+bool loadServoFromEEPROM() {
+  ServoData d;
+  #ifdef BOARD_SAMD21
+    d = servoStorage.read();
+  #else
+    EEPROM.get(SERVO_EEPROM_ADDR, d);
+  #endif
+  if (d.magic == SERVO_MAGIC && d.openUs >= SERVO_US_MIN && d.openUs <= SERVO_US_MAX &&
+      d.closedUs >= SERVO_US_MIN && d.closedUs <= SERVO_US_MAX && d.openUs != d.closedUs) {
+    g_openUs = d.openUs;
+    g_closedUs = d.closedUs;
+    Serial.print(F("Loaded servo endpoints: OPEN ")); Serial.print(g_openUs);
+    Serial.print(F(" us, CLOSED ")); Serial.print(g_closedUs); Serial.println(F(" us"));
+    return true;
+  }
+  Serial.print(F("No saved servo endpoints, using v4 defaults: OPEN ")); Serial.print(g_openUs);
+  Serial.print(F(" us, CLOSED ")); Serial.print(g_closedUs); Serial.println(F(" us"));
+  return false;
+}
+
+void saveServoToEEPROM() {
+  ServoData d;
+  d.magic = SERVO_MAGIC;
+  d.openUs = (int16_t)g_openUs;
+  d.closedUs = (int16_t)g_closedUs;
+  #ifdef BOARD_SAMD21
+    servoStorage.write(d);
+  #else
+    EEPROM.put(SERVO_EEPROM_ADDR, d);
+    EEPROM.commit();
+  #endif
+  Serial.print(F("Saved servo endpoints: OPEN ")); Serial.print(g_openUs);
+  Serial.print(F(" us, CLOSED ")); Serial.print(g_closedUs); Serial.println(F(" us"));
+}
+
+void printServoSettings() {
+  Serial.println(F("\n--- Servo settings ---"));
+  Serial.print(F("  OPEN:   ")); Serial.print(g_openUs); Serial.println(F(" us"));
+  Serial.print(F("  CLOSED: ")); Serial.print(g_closedUs); Serial.println(F(" us"));
+  Serial.print(F("  Travel: ")); Serial.print(abs(g_openUs - g_closedUs)); Serial.println(F(" us (~10 us per servo degree)"));
+  Serial.print(F("  Limits: ")); Serial.print(SERVO_US_MIN); Serial.print(F("-")); Serial.print(SERVO_US_MAX); Serial.println(F(" us"));
+  Serial.print(F("  Feedback closed/open: ")); Serial.print(g_minFeedback, 4); Serial.print(F(" / ")); Serial.print(g_maxFeedback, 4);
+  Serial.println(g_fbValid ? F("") : F("  (stale - send R)"));
+  Serial.println(F("----------------------\n"));
+}
+
+void printCommands() {
+  Serial.println(F("Serial Commands:"));
+  Serial.println(F("  O or o - Open vent"));
+  Serial.println(F("  C or c - Close vent"));
+  Serial.println(F("  R or r - Recalibrate servo feedback (moves between endpoints only)"));
+  Serial.println(F("  F or f - Read current feedback (no movement)"));
+  Serial.println(F("  S or s - Toggle standby mode"));
+  Serial.println(F("  L or l - Enter learning mode"));
+  Serial.println(F("  N or n - Next (advance learning mode phase)"));
+  Serial.println(F("  T or t - Run ACS758 connectivity self-test"));
+  Serial.println(F("  M or m - Move servo to mid (1500 us) - use when installing the gear"));
+  Serial.println(F("  [ / ]  - Trim OPEN endpoint -10 / +10 us (moves there)"));
+  Serial.println(F("  { / }  - Trim CLOSED endpoint -10 / +10 us (moves there)"));
+  Serial.println(F("  X or x - Swap OPEN and CLOSED (if the vent works backwards)"));
+  Serial.println(F("  W or w - Save endpoints to flash"));
+  Serial.println(F("  P or p - Print servo settings"));
+  Serial.println(F("  A or a - Self-calibrate the servo (uses the button to confirm)"));
+  Serial.println(F("  H or ? - Show this list"));
+  Serial.println(F("  0-180  - Move servo to degrees (0 = 900 us, 180 = 2100 us)"));
+  Serial.println(F("  900-2100 - Move servo to pulse width in us"));
+  Serial.println(F("  (manual moves are limited to the endpoints +/-100 us)"));
+  Serial.println(F("Button:"));
+  Serial.println(F("  Short press       - Full recalibration"));
+  Serial.println(F("  Long press 2s     - Toggle standby/wake"));
+  Serial.println(F("  Very long press 5s - Enter learning mode"));
+  Serial.println(F("  Hold while plugging in power - Servo self-calibration"));
+  Serial.println(F("========================================\n"));
+}
+
+// Trim an endpoint and move there so the result can be seen
+static void trimEndpoint(bool openEnd, int delta) {
+  int &ep = openEnd ? g_openUs : g_closedUs;
+  int other = openEnd ? g_closedUs : g_openUs;
+  int nv = clampUs(ep + delta, SERVO_US_MIN, SERVO_US_MAX);
+  if (nv == other) { Serial.println(F("Endpoints cannot be equal")); return; }
+  ep = nv;
+  g_fbValid = false;
+  Serial.print(openEnd ? F("OPEN") : F("CLOSED"));
+  Serial.print(F(" endpoint now ")); Serial.print(ep); Serial.println(F(" us (not saved - send W to save)"));
+  moveServoUs(ep);
+}
+
+// ----------------- Self-calibrating servo setup (no computer needed) -----------------
+// The cover's slot stops sit 2 deg of cover travel past each end of its 21 deg stroke, so the
+// stop-to-stop window is 25 deg of cover and OPEN/CLOSED sit 2/25 of that window inside each stop.
+static const int   AUTO_STEP_US       = 5;      // creep step
+static const uint32_t AUTO_STEP_MS    = 20;     // 5 us / 20 ms = ~25 servo deg per second
+static const int   AUTO_PROBE_US      = 75;     // slope probe each side of mid (free travel)
+static const int   AUTO_STALL_US      = 40;     // servo this far behind the command = touching a stop
+static const int   AUTO_RELIEF_US     = 60;     // immediate back-off when a stop is touched
+static const float AUTO_INSET_FRAC    = 2.0f / 25.0f;
+static const int   AUTO_MIN_WINDOW_US = 800;    // plausible stop-to-stop window (design ~1110 us)
+static const int   AUTO_MAX_WINDOW_US = 1400;
+// Design window: 21 deg stroke + 2 deg each side = 25 deg of cover = 111.4 servo deg (107/24 ratio)
+// at ~10 us per servo degree. The window nearly fills the 900-2100 us rating, so if the gear went
+// on a tooth off-center one stop can sit outside the rating; that side is then set from the
+// design stroke instead of being touched.
+static const int   AUTO_DESIGN_WINDOW_US = 1114;
+
+static void setupLed(LEDPattern p, uint8_t r, uint8_t g, uint8_t b) {
+  setLEDPattern(p);
+  #ifdef BOARD_RP2040
+    neopixel.setPixelColor(0, neopixel.Color(r, g, b));
+    neopixel.show();
+  #endif
+}
+
+static void setupDelay(uint32_t ms) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < ms) { updateLEDPattern(); delay(5); }
+}
+
+// Wait for a full press and release; returns how long it was held (ms).
+// When a press passes the long-press time the light goes solid so you know to let go.
+static uint32_t setupWaitPress() {
+  while (digitalRead(BUTTON_PIN) == LOW) { updateLEDPattern(); delay(5); }
+  setupDelay(60);
+  while (digitalRead(BUTTON_PIN) == HIGH) { updateLEDPattern(); delay(5); }
+  uint32_t t0 = millis();
+  LEDPattern prev = g_ledPattern;
+  bool signaled = false;
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    if (!signaled && millis() - t0 >= LONG_PRESS_MS) { setLEDPattern(LED_SOLID); signaled = true; }
+    updateLEDPattern(); delay(5);
+  }
+  uint32_t held = millis() - t0;
+  if (signaled) setLEDPattern(prev);
+  setupDelay(60);
+  return held;
+}
+
+// Slow ramp while the servo stays attached (used only inside the setup routine)
+static void setupRamp(int to) {
+  int cur = g_lastUs < 0 ? to : g_lastUs;
+  while (cur != to) {
+    cur += (to > cur) ? min(AUTO_STEP_US * 2, to - cur) : -min(AUTO_STEP_US * 2, cur - to);
+    servo.writeMicroseconds(cur);
+    delay(AUTO_STEP_MS); updateLEDPattern();
+  }
+  g_lastUs = to;
+}
+
+// Creep toward one side until the servo stops making progress.
+// 2.2.1: stall = the feedback stops CHANGING as the command advances (local progress over the
+// last 40 us of command), instead of comparing against one straight-line model of the feedback
+// pot. A pot that is slightly non-linear made 2.2.0 see a false stop part way to one side.
+// Returns the stop position in command microseconds, or -1 if no stop was found.
+static int findStop(int dir, float slopeSeed) {
+  const int N = 4;                    // readings every 10 us -> compare over 40 us of command
+  int cmdHist[N + 1];
+  float fbHist[N + 1];
+  int count = 0, flat = 0;
+  float slope = slopeSeed;            // feedback per us, refined while travel is free
+  int cmd = g_lastUs;
+  while (true) {
+    bool atLimit = false;
+    cmd += dir * AUTO_STEP_US;
+    if (cmd <= SERVO_US_MIN) { cmd = SERVO_US_MIN; atLimit = true; }
+    if (cmd >= SERVO_US_MAX) { cmd = SERVO_US_MAX; atLimit = true; }
+    servo.writeMicroseconds(cmd);
+    g_lastUs = cmd;
+    delay(atLimit ? 250 : AUTO_STEP_MS); updateLEDPattern();
+    if (!atLimit && abs(cmd - SERVO_US_MID) % 10 != 0) continue;
+    float fb = readServoFeedback01();
+    for (int i = N; i > 0; i--) { cmdHist[i] = cmdHist[i - 1]; fbHist[i] = fbHist[i - 1]; }
+    cmdHist[0] = cmd; fbHist[0] = fb;
+    if (count < N + 1) count++;
+    if (count == N + 1) {
+      int dCmd = cmdHist[0] - cmdHist[N];
+      float got = fbHist[0] - fbHist[N];
+      if (abs(dCmd) >= 20) {
+        float progress = got / (slope * dCmd);   // ~1 = moving freely, ~0 = stopped
+        if (progress < 0.35f) {
+          if (++flat >= 2) {
+            float est = cmdHist[N] + got / slope;   // where the servo actually got to
+            int lo = min(cmdHist[0], cmdHist[N]), hi = max(cmdHist[0], cmdHist[N]);
+            int stopUs = clampUs((int)lroundf(est), lo, hi);
+            int relief = stopUs - dir * AUTO_RELIEF_US;    // back off the stop right away
+            servo.writeMicroseconds(relief);
+            g_lastUs = relief;
+            setupDelay(250);
+            Serial.print(F("  Stop found at ~")); Serial.print(stopUs); Serial.println(F(" us"));
+            return stopUs;
+          }
+        } else {
+          flat = 0;
+          if (progress > 0.7f && progress < 1.4f) slope = 0.8f * slope + 0.2f * (got / dCmd);
+        }
+      }
+    }
+    if (atLimit && flat == 0 && count == N + 1) return -1;  // reached the rating limit moving freely
+    if (atLimit) setupDelay(100);
+  }
+}
+
+static void setupFail(const __FlashStringHelper *why) {
+  Serial.print(F("SELF-CALIBRATION FAILED: ")); Serial.println(why);
+  Serial.println(F("Previous endpoints kept. Check the gear and feedback wire, then hold the button while plugging in to retry."));
+  setupRamp(SERVO_US_MID);
+  servo.detach();
+  setupLed(LED_FAST_FLASH, 40, 0, 0);
+  setupDelay(5000);
+}
+
+// Returns true if new endpoints were found and saved
+bool runServoAutoSetup() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("SERVO SELF-CALIBRATION"));
+  Serial.println(F("========================================"));
+
+  // 1. Park at mid and hold it so the gear can be pressed on
+  servoAttach();
+  servo.writeMicroseconds(SERVO_US_MID);
+  g_lastUs = SERVO_US_MID;
+  setupLed(LED_FAST_FLASH, 40, 0, 40);
+  Serial.println(F("Servo is at mid. Set the cover halfway between its two stops,"));
+  Serial.println(F("press the gear on (or leave it if already installed), then press the button."));
+  setupWaitPress();
+
+  // 2. Learn how the feedback tracks the command, using free travel either side of mid
+  setupLed(LED_SLOW_FLASH, 40, 0, 40);
+  Serial.println(F("Finding the stops..."));
+  setupRamp(SERVO_US_MID); setupDelay(300);
+  float fbMid = readServoFeedback01();
+  setupRamp(SERVO_US_MID - AUTO_PROBE_US); setupDelay(300);
+  float fbLo = readServoFeedback01();
+  setupRamp(SERVO_US_MID + AUTO_PROBE_US); setupDelay(300);
+  float fbHi = readServoFeedback01();
+  float sLo = (fbMid - fbLo) / AUTO_PROBE_US, sHi = (fbHi - fbMid) / AUTO_PROBE_US;
+  if (fabsf(fbHi - fbLo) < 0.01f) { setupFail(F("feedback does not change (wire or servo)")); return false; }
+  if (sLo * sHi <= 0 || fabsf(sLo - sHi) > 0.4f * max(fabsf(sLo), fabsf(sHi))) {
+    setupFail(F("cover hit a stop near mid - reinstall the gear with the cover halfway")); return false;
+  }
+  float slope = (fbHi - fbLo) / (2.0f * AUTO_PROBE_US);
+
+  // 3. Find both stops (continues from mid + probe, then returns through mid)
+  int hiStop = findStop(+1, slope);
+  setupRamp(SERVO_US_MID); setupDelay(200);
+  int loStop = findStop(-1, slope);
+  // Endpoints sit 2 deg of cover inside each stop. A stop that was not found is beyond the
+  // detection limit (rating limit minus the stall threshold), so that bound is used instead:
+  // the vent can then come up a little short of full travel on that side, but never touches a stop.
+  int stroke = (int)lroundf(AUTO_DESIGN_WINDOW_US * (1.0f - 2.0f * AUTO_INSET_FRAC));   // ~936 us
+  int inset  = (int)lroundf(AUTO_DESIGN_WINDOW_US * AUTO_INSET_FRAC);                   // ~89 us
+  if (hiStop >= 0 && loStop >= 0) {
+    int window = hiStop - loStop;
+    Serial.print(F("  Stop-to-stop window: ")); Serial.print(window); Serial.println(F(" us"));
+    if (window < AUTO_MIN_WINDOW_US || window > AUTO_MAX_WINDOW_US) { setupFail(F("stop-to-stop window out of range")); return false; }
+    inset = (int)lroundf(window * AUTO_INSET_FRAC);
+  }
+  int loBound = (loStop >= 0) ? loStop + inset : SERVO_US_MIN + AUTO_STALL_US + inset;
+  int hiBound = (hiStop >= 0) ? hiStop - inset : SERVO_US_MAX - AUTO_STALL_US - inset;
+  int loEnd, hiEnd;
+  if (hiStop >= 0 && loStop >= 0) {
+    loEnd = loBound; hiEnd = hiBound;
+  } else if (loStop >= 0) {
+    Serial.println(F("  High-side stop is beyond the servo rating; that end is set from the design stroke"));
+    loEnd = loBound; hiEnd = min(hiBound, loEnd + stroke);
+  } else if (hiStop >= 0) {
+    Serial.println(F("  Low-side stop is beyond the servo rating; that end is set from the design stroke"));
+    hiEnd = hiBound; loEnd = max(loBound, hiEnd - stroke);
+  } else {
+    Serial.println(F("  WARNING: no stops found inside the servo rating - check the gear is installed and meshed"));
+    loEnd = max(loBound, SERVO_US_MID - stroke / 2);
+    hiEnd = min(hiBound, SERVO_US_MID + stroke / 2);
+  }
+  if (hiEnd - loEnd < (stroke * 3) / 4) { setupFail(F("not enough travel inside the servo rating - reinstall the gear with the cover halfway")); return false; }
+
+  // 4. Confirm which end is open: short press = correct, hold 2 s = swap
+  bool openLow = (g_openUs < g_closedUs);   // keep the current orientation as the first guess
+  while (true) {
+    setupRamp(openLow ? loEnd : hiEnd);
+    setupLed(LED_DOUBLE_BLINK, 0, 40, 0);
+    Serial.println(F("The vent should now be OPEN."));
+    Serial.println(F("  Open?   short press to accept"));
+    Serial.println(F("  Closed? hold 2 s (light goes solid), release to swap"));
+    if (setupWaitPress() < LONG_PRESS_MS) break;
+    openLow = !openLow;
+    Serial.println(F("Swapped."));
+  }
+  g_openUs   = openLow ? loEnd : hiEnd;
+  g_closedUs = openLow ? hiEnd : loEnd;
+  saveServoToEEPROM();
+  g_fbValid = false;
+
+  // 5. Close and finish
+  setupRamp(g_closedUs); setupDelay(SERVO_SETTLE_MS);
+  servo.detach();
+  setupLed(LED_SUCCESS_BLINK, 0, 40, 0);
+  setupDelay(1500);
+  Serial.println(F("SELF-CALIBRATION COMPLETE"));
+  printServoSettings();
+  return true;
+}
+
+// Run full calibration (servo + current offset)
+// Called at startup and when button is pressed
+void runFullCalibration() {
+  g_calibrated = false;  // Mark as not calibrated
+  setLEDPattern(LED_SLOW_FLASH);  // Flash LED during calibration
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("FULL CALIBRATION STARTING"));
+  Serial.println(F("========================================"));
+
+  // === SERVO CALIBRATION ===
+  Serial.println(F("\n--- SERVO CALIBRATION (endpoints only) ---"));
+  calibrateServoFeedback(true);
+
+  // === CURRENT OFFSET CALIBRATION ===
+  Serial.println(F("\n--- CURRENT OFFSET CALIBRATION ---"));
+  Serial.println(F("IMPORTANT: Ensure dryer is OFF"));
+  delayWithFlashing(1000);
+
+  g_voltageOffset = calculateOffset(OFFSET_MEASURE_MS);
+
+  // Clear rolling average buffer to remove any stale data
+  g_sampleIndex = 0;
+  g_sampleCount = 0;
+  for (uint8_t i = 0; i < MAX_SAMPLES; i++) {
+    g_currentSamples[i] = 0.0f;
+  }
+
+  // Mark calibration complete - LED stays solid, vent is closed
+  g_calibrated = true;
+  g_ventOpen = false;
+  g_ventClosePending = false;
+  g_heaterWasOn = false;  // Reset heater state tracking
+  g_systemOn = true;
+
+  // Reset all device state detection flags (assume everything OFF after calibration)
+  g_fanOn = false;
+  g_heaterOn = false;
+  g_systemActive = false;
+
+  setLEDPattern(LED_SOLID);  // Set LED to solid on after calibration
+
+  // Allow sensor to settle after calibration
+  Serial.println(F("\nAllowing sensor to settle (3 seconds)..."));
+  delay(3000);
+
+  Serial.println(F("\n========================================"));
+  Serial.println(F("CALIBRATION COMPLETE - System Ready"));
+  Serial.println(F("========================================\n"));
+}
+
+// Enter standby mode - close vent, turn off LED, stop monitoring
+void enterStandbyMode() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("ENTERING STANDBY MODE"));
+  Serial.println(F("========================================"));
+
+  // Close the vent
+  closeVent();
+  g_ventOpen = false;
+  g_ventClosePending = false;
+
+  // Turn off LED
+  setLEDPattern(LED_OFF);
+
+  // Set system off
+  g_systemOn = false;
+
+  Serial.println(F("System is now in STANDBY"));
+  Serial.println(F("Long press button to wake up"));
+  Serial.println(F("========================================\n"));
+}
+
+// Load thresholds from EEPROM
+bool loadThresholdsFromEEPROM() {
+  ThresholdData data;
+
+  #ifdef BOARD_SAMD21
+    data = thresholdStorage.read();
+  #else  // RP2040
+    EEPROM.begin(512);  // Initialize EEPROM with 512 bytes
+    EEPROM.get(0, data);
+  #endif
+
+  if (data.magic == EEPROM_MAGIC) {
+    FAN_ON_THRESHOLD = data.fanOnThreshold;
+    FAN_OFF_THRESHOLD = data.fanOffThreshold;
+    HEATER_ON_THRESHOLD = data.heaterOnThreshold;
+    HEATER_OFF_THRESHOLD = data.heaterOffThreshold;
+
+    Serial.println(F("\n=== Loaded thresholds from EEPROM ==="));
+    Serial.print(F("  Fan ON:  ")); Serial.print(FAN_ON_THRESHOLD, 4); Serial.println(F("A"));
+    Serial.print(F("  Fan OFF: ")); Serial.print(FAN_OFF_THRESHOLD, 4); Serial.println(F("A"));
+    Serial.print(F("  Heat ON: ")); Serial.print(HEATER_ON_THRESHOLD, 4); Serial.println(F("A"));
+    Serial.print(F("  Heat OFF:")); Serial.print(HEATER_OFF_THRESHOLD, 4); Serial.println(F("A"));
+    Serial.println(F("=======================================\n"));
+    return true;
+  }
+
+  Serial.println(F("No learned thresholds found, using defaults"));
+  return false;
+}
+
+// Save thresholds to EEPROM
+void saveThresholdsToEEPROM() {
+  ThresholdData data;
+  data.magic = EEPROM_MAGIC;
+  data.fanOnThreshold = FAN_ON_THRESHOLD;
+  data.fanOffThreshold = FAN_OFF_THRESHOLD;
+  data.heaterOnThreshold = HEATER_ON_THRESHOLD;
+  data.heaterOffThreshold = HEATER_OFF_THRESHOLD;
+
+  #ifdef BOARD_SAMD21
+    thresholdStorage.write(data);
+  #else  // RP2040
+    EEPROM.put(0, data);
+    EEPROM.commit();  // RP2040 requires explicit commit
+  #endif
+
+  Serial.println(F("\n=== Saved thresholds to EEPROM ==="));
+  Serial.print(F("  Fan ON:  ")); Serial.print(FAN_ON_THRESHOLD, 4); Serial.println(F("A"));
+  Serial.print(F("  Fan OFF: ")); Serial.print(FAN_OFF_THRESHOLD, 4); Serial.println(F("A"));
+  Serial.print(F("  Heat ON: ")); Serial.print(HEATER_ON_THRESHOLD, 4); Serial.println(F("A"));
+  Serial.print(F("  Heat OFF:")); Serial.print(HEATER_OFF_THRESHOLD, 4); Serial.println(F("A"));
+  Serial.println(F("===================================\n"));
+}
+
+// Start learning mode
+void startLearningMode() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("ENTERING LEARNING MODE"));
+  Serial.println(F("========================================"));
+  Serial.println(F("This will learn optimal thresholds"));
+  Serial.println(F(""));
+  Serial.println(F("LED patterns:"));
+  Serial.println(F("  FLASHING = Measuring now (don't touch)"));
+  Serial.println(F("  SOLID = Waiting - make change, press button"));
+  Serial.println(F("  3 LONG BLINKS = All done!"));
+  Serial.println(F(""));
+  Serial.println(F("PHASE 1: Ensure dryer is completely OFF"));
+  Serial.println(F("Press button when ready..."));
+  Serial.println(F("========================================\n"));
+
+  g_learningPhase = LEARN_BASELINE;
+  g_learnedBaseline = 0.0f;
+  g_learnedHeater = 0.0f;
+  g_learnedFanOnly = 0.0f;
+  g_learningStartMs = 0;  // Not measuring yet
+  g_learningPhaseEntryMs = millis();
+
+  // Start with solid LED - waiting for user to press button
+  setLEDPattern(LED_SOLID);
+}
+
+// Process learning phase
+void processLearningPhase() {
+  uint32_t now = millis();
+
+  // Check if we're in learning mode
+  if (g_learningPhase != LEARN_NONE) {
+    // Update LED pattern
+    updateLEDPattern();
+
+    // Check if measurement period started
+    if (g_learningStartMs > 0) {
+      if (now - g_learningStartMs >= LEARNING_MEASURE_MS) {
+        // Measurement complete - stop measuring and wait for user
+        g_learningStartMs = 0;
+
+        // Move to next phase
+        switch (g_learningPhase) {
+          case LEARN_BASELINE:
+            Serial.print(F("Baseline learned: "));
+            Serial.print(g_learnedBaseline, 4);
+            Serial.println(F("A\n"));
+
+            g_learningPhase = LEARN_HEATER;
+            setLEDPattern(LED_SOLID);
+            Serial.println(F("PHASE 2: Turn dryer ON (heater + fan)"));
+            Serial.println(F("Press button when ready..."));
+            break;
+
+          case LEARN_HEATER:
+            Serial.print(F("Heater+Fan learned: "));
+            Serial.print(g_learnedHeater, 4);
+            Serial.println(F("A\n"));
+
+            g_learningPhase = LEARN_FAN_ONLY;
+            setLEDPattern(LED_SOLID);
+            Serial.println(F("PHASE 3: Turn heater OFF (fan only)"));
+            Serial.println(F("Press button when ready..."));
+            break;
+
+          case LEARN_FAN_ONLY:
+            Serial.print(F("Fan only learned: "));
+            Serial.print(g_learnedFanOnly, 4);
+            Serial.println(F("A\n"));
+
+            // Calculate optimal thresholds
+            Serial.println(F("Calculating thresholds..."));
+
+            // Fan threshold = halfway between baseline and fan-only
+            FAN_ON_THRESHOLD = (g_learnedBaseline + g_learnedFanOnly) / 2.0f + 0.002f;  // Add 2mA margin
+            FAN_OFF_THRESHOLD = FAN_ON_THRESHOLD - 0.005f;  // 5mA hysteresis
+
+            // Heater threshold = halfway between fan-only and heater
+            // Heat OFF must sit ABOVE fan-only current so it trips when heater stops but fan continues
+            HEATER_ON_THRESHOLD = (g_learnedFanOnly + g_learnedHeater) / 2.0f;
+            HEATER_OFF_THRESHOLD = g_learnedFanOnly + (g_learnedHeater - g_learnedFanOnly) * 0.25f;
+
+            // Save to EEPROM
+            saveThresholdsToEEPROM();
+
+            // Show completion blink
+            g_learningPhase = LEARN_COMPLETE;
+            setLEDPattern(LED_COMPLETE_BLINK);
+            Serial.println(F("========================================"));
+            Serial.println(F("LEARNING COMPLETE!"));
+            Serial.println(F("Thresholds saved to EEPROM"));
+            Serial.println(F("========================================\n"));
+
+            delay(3500);  // Wait for complete blink
+
+            // Return to normal operation
+            g_learningPhase = LEARN_NONE;
+            setLEDPattern(LED_SOLID);
+            break;
+
+          default:
+            break;
+        }
+      } else {
+        // Still measuring - accumulate current reading
+        float Irms = measureIrmsOver(SAMPLE_MS);
+
+        switch (g_learningPhase) {
+          case LEARN_BASELINE:
+            // Running average
+            if (g_learnedBaseline == 0.0f) {
+              g_learnedBaseline = Irms;
+            } else {
+              g_learnedBaseline = g_learnedBaseline * 0.9f + Irms * 0.1f;
+            }
+            break;
+
+          case LEARN_HEATER:
+            // Take maximum reading (heater may cycle)
+            if (Irms > g_learnedHeater) {
+              g_learnedHeater = Irms;
+            }
+            break;
+
+          case LEARN_FAN_ONLY:
+            // Running average
+            if (g_learnedFanOnly == 0.0f) {
+              g_learnedFanOnly = Irms;
+            } else {
+              g_learnedFanOnly = g_learnedFanOnly * 0.9f + Irms * 0.1f;
+            }
+            break;
+
+          default:
+            break;
+        }
+
+        // Print progress every second
+        static uint32_t lastProgress = 0;
+        if (now - lastProgress >= 1000) {
+          uint32_t remaining = (LEARNING_MEASURE_MS - (now - g_learningStartMs)) / 1000;
+          Serial.print(F("  Measuring... "));
+          Serial.print(remaining);
+          Serial.print(F("s remaining ("));
+          Serial.print(Irms, 4);
+          Serial.println(F("A)"));
+          lastProgress = now;
+        }
+      }
+    }
+  }
+}
+
+// Handle learning mode button press
+void handleLearningButtonPress() {
+  if (g_learningPhase != LEARN_NONE && g_learningPhase != LEARN_COMPLETE) {
+    if (g_learningStartMs == 0) {
+      // Start measurement - switch to flashing LED
+      Serial.println(F("Starting measurement..."));
+      g_learningStartMs = millis();
+      setLEDPattern(LED_FAST_FLASH);
+    }
+  }
+}
+
+// ----------------- Setup -----------------
+void setup() {
+  // Initialize LED and button pins first
+  #ifdef BOARD_RP2040
+    // CRITICAL: RP2040 requires explicit GPIO function setup
+    // GPIO3 (D10) defaults to SPI MOSI, must set to GPIO mode
+    // GPIO26 (D0) needs PWM function for servo
+    // GPIO29 (D3) needs GPIO mode for button
+    gpio_set_function(GPIO_LED, GPIO_FUNC_SIO);    // D10/GPIO3 to GPIO mode
+    gpio_set_function(GPIO_SERVO, GPIO_FUNC_PWM);  // D0/GPIO26 to PWM mode
+    gpio_set_function(GPIO_BTN, GPIO_FUNC_SIO);    // D3/GPIO29 to GPIO mode
+
+    // Set maximum drive strength for LED (makes it brighter)
+    gpio_set_drive_strength(GPIO_LED, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(GPIO_LED, GPIO_SLEW_RATE_FAST);
+  #endif
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delay(50);
+  g_bootButtonHeld = (digitalRead(BUTTON_PIN) == LOW);  // held while power was applied
+  #ifdef BOARD_SAMD21
+    pinMode(LED_BUILTIN, OUTPUT);
+  #endif
+  digitalWrite(LED_PIN, LOW);  // LED off initially
+
+  #ifdef BOARD_RP2040
+    // Initialize NeoPixel power and breathing effect
+    pinMode(NEOPIXEL_POWER_PIN, OUTPUT);
+    digitalWrite(NEOPIXEL_POWER_PIN, HIGH);  // Power on the NeoPixel
+    neopixel.begin();
+    neopixel.setBrightness(255);  // Full brightness control in code
+    neopixel.show(); // Initialize all pixels to 'off'
+    g_breathingStartMs = millis();
+  #else
+    digitalWrite(LED_BUILTIN, LOW);  // LED off Initially (SAMD21)
+  #endif
+
+  Serial.begin(115200);
+
+  // Wait for Serial with timeout
+  uint32_t serialTimeout = millis();
+  while (!Serial && (millis() - serialTimeout < 3000)) { }
+
+  Serial.println(F("\n\n========================================"));
+  Serial.println(F("SUNLU AMS Heater Auto-Vent Controller"));
+  Serial.print(F("Firmware Version: "));
+  Serial.println(F(FIRMWARE_VERSION));
+  Serial.print(F("Build Date: "));
+  Serial.print(F(FIRMWARE_DATE));
+  Serial.print(F(" "));
+  Serial.println(F(FIRMWARE_TIME));
+  Serial.print(F("Hardware Version: "));
+  Serial.println(HARDWARE_VERSION);
+  Serial.print(F("Board: Seeed XIAO "));
+  Serial.println(F(MY_BOARD_NAME));
+  Serial.println(F("ADS1115 + ACS758 + Servo"));
+  Serial.println(F("========================================\n"));
+
+  Serial.println(F("Initializing ADS1115..."));
+  if (!ads.begin()) {
+    Serial.println(F("ERROR: ADS1115 not found! Check I2C wiring."));
+    while(1) {
+      delay(1000);
+      Serial.println(F("ERROR: ADS1115 not found!"));
+    }
+  }
+
+  ads.setGain(GAIN_ONE);  // ±4.096V range
+  ads.setDataRate(RATE_ADS1115_128SPS);  // 128 samples per second
+  Serial.println(F("ADS1115 initialized successfully\n"));
+
+  // Verify the ACS758 is actually wired to the ADC before we trust any reading.
+  // This is advisory: a bad verdict is reported but does not halt the system,
+  // so a false positive can never brick a working dryer.
+  g_acsTestResult = runAcsSelfTest(true);
+  if (g_acsTestResult >= ACS_FAIL_FLOATING) {
+    Serial.println(F("*** ACS758 SELF-TEST FAILED - current readings are NOT trustworthy ***"));
+    Serial.println(F("*** Fix the wiring, then press the button or send 'T' to retest.   ***\n"));
+    setLEDPattern(LED_FAST_FLASH);
+    delayWithFlashing(3000);
+  }
+
+  // Load learned thresholds from EEPROM (if available)
+  loadThresholdsFromEEPROM();
+
+  // Load v4 servo endpoints (separate record; defaults if none saved)
+  bool haveServoEndpoints = loadServoFromEEPROM();
+
+  // Self-calibrate when the button was held at power-up, or when nothing is saved yet
+  if (g_bootButtonHeld || !haveServoEndpoints) {
+    Serial.println(g_bootButtonHeld ? F("Button held at power-up") : F("No saved servo endpoints"));
+    runServoAutoSetup();
+    while (digitalRead(BUTTON_PIN) == LOW) { delay(10); }   // make sure no press leaks into loop()
+    g_lastButtonState = HIGH;
+    g_buttonHandled = true;
+  }
+
+  // Run full calibration (servo + current offset)
+  runFullCalibration();
+
+  // Print available commands
+  printCommands();
+
+  g_lastUpdateMs = millis();
+  setLEDPattern(LED_SOLID);
+}
+
+// ----------------- Loop -----------------
+void loop() {
+  static bool longPressExecuted = false;  // Declare at function scope
+  uint32_t now = millis();
+
+  // Check for button press FIRST (before learning mode processing)
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+
+  // Button just pressed - start timing
+  if (currentButtonState == LOW && g_lastButtonState == HIGH) {
+    g_buttonPressStart = now;
+    g_buttonHandled = false;
+  }
+
+  // Button is being held - check for very long press first, then long press
+  // Skip long/very long press detection if already in learning mode
+  if (currentButtonState == LOW && g_learningPhase == LEARN_NONE) {
+    uint32_t pressDuration = now - g_buttonPressStart;
+
+    // Check for very long press (>5s) - takes priority, overrides long press
+    if (pressDuration >= VLONG_PRESS_MS) {
+      if (!g_buttonHandled) {
+        g_buttonHandled = true;  // Prevent repeated triggers
+        Serial.println(F("\n*** VERY LONG PRESS DETECTED ***"));
+
+        // Cancel standby if it was triggered
+        if (!g_systemOn) {
+          g_systemOn = true;
+          setLEDPattern(LED_FAST_FLASH);
+        }
+
+        startLearningMode();
+        g_ignoreNextRelease = true;  // Ignore the button release after entering learning mode
+      }
+    }
+    // Check for long press (2s) - but only if very long press hasn't been handled yet
+    else if (pressDuration >= LONG_PRESS_MS && !g_buttonHandled) {
+      // Don't mark as handled yet - allow very long press to override
+      // Just execute the long press action once
+      if (!longPressExecuted) {
+        longPressExecuted = true;
+
+        if (g_systemOn) {
+          // System is ON - enter standby mode
+          Serial.println(F("\n*** LONG PRESS DETECTED ***"));
+          enterStandbyMode();
+        } else {
+          // System is OFF - wake up with full calibration
+          Serial.println(F("\n*** LONG PRESS DETECTED ***"));
+          Serial.println(F("Waking up from standby..."));
+          runFullCalibration();
+        }
+      }
+    }
+  }
+
+  // Reset long press executed flag when button is released
+  if (currentButtonState == HIGH && g_lastButtonState == LOW) {
+    longPressExecuted = false;
+  }
+
+  // Button just released - check for short press
+  if (currentButtonState == HIGH && g_lastButtonState == LOW) {
+    // Check if we're in learning mode waiting for button press
+    if (g_learningPhase != LEARN_NONE) {
+      // Ignore the first button release after entering learning mode
+      if (g_ignoreNextRelease) {
+        Serial.println(F("Ignoring button release from learning mode entry"));
+        g_ignoreNextRelease = false;
+      } else {
+        Serial.println(F("Button released during learning mode"));
+        handleLearningButtonPress();
+      }
+    } else if (!g_buttonHandled) {
+      // Short press detected (released before long press threshold)
+      Serial.println(F("\n*** SHORT PRESS DETECTED ***"));
+      Serial.println(F("Running recalibration..."));
+      runFullCalibration();
+    }
+  }
+
+  g_lastButtonState = currentButtonState;
+
+  // Check for serial commands (MUST be before learning mode processing to allow 'N' command)
+  while (Serial.available()) {
+    char ch = Serial.read();
+
+    // Handle newline - process buffered command
+    if (ch == '\n' || ch == '\r') {
+      if (g_serialIdx > 0) {
+        g_serialBuffer[g_serialIdx] = '\0';  // Null terminate
+
+        // Check if it's a number
+        bool isNumber = true;
+        for (uint8_t i = 0; i < g_serialIdx; i++) {
+          if (!isdigit(g_serialBuffer[i])) {
+            isNumber = false;
+            break;
+          }
+        }
+
+        if (isNumber) {
+          int val = atoi(g_serialBuffer);
+          int us = -1;
+          if (val >= 0 && val <= 180) us = SERVO_US_MIN + (int)lroundf(val * (SERVO_US_MAX - SERVO_US_MIN) / 180.0f);
+          else if (val >= 500 && val <= 2500) us = val;
+          if (us < 0) {
+            Serial.println(F("Invalid value (use 0-180 degrees or 900-2100 us)"));
+          } else {
+            int lo = max(SERVO_US_MIN, min(g_openUs, g_closedUs) - SERVO_MANUAL_MARGIN_US);
+            int hi = min(SERVO_US_MAX, max(g_openUs, g_closedUs) + SERVO_MANUAL_MARGIN_US);
+            if (us < lo || us > hi) {
+              Serial.print(F("Limited to the endpoint window "));
+              Serial.print(lo); Serial.print(F("-")); Serial.print(hi); Serial.println(F(" us"));
+              us = clampUs(us, lo, hi);
+            }
+            moveServoUs(us);
+          }
+        }
+        g_serialIdx = 0;  // Reset buffer
+      }
+    }
+    // Handle single character commands immediately
+    else if (g_serialIdx == 0 && !isdigit(ch)) {
+      if (ch == 'O' || ch == 'o') {
+        openVent();
+      } else if (ch == 'C' || ch == 'c') {
+        closeVent();
+      } else if (ch == 'R' || ch == 'r') {
+        calibrateFromCurrentPosition();
+      } else if (ch == 'F' || ch == 'f') {
+        // Just read feedback without moving anything
+        float fb = readServoFeedback01();
+        Serial.print(F("Current feedback: "));
+        Serial.print(fb, 4);
+        int estUs = feedbackToUs(fb);
+        if (estUs > 0) {
+          Serial.print(F(" = ~"));
+          Serial.print(estUs);
+          Serial.print(F(" us, "));
+          Serial.print(feedbackToPercentOpen(fb));
+          Serial.println(F("% open"));
+        } else {
+          Serial.println(F(" (feedback not calibrated)"));
+        }
+      } else if (ch == 'S' || ch == 's') {
+        // Toggle standby mode
+        if (g_systemOn) {
+          enterStandbyMode();
+        } else {
+          Serial.println(F("\nWaking up from standby..."));
+          runFullCalibration();
+        }
+      } else if (ch == 'L' || ch == 'l') {
+        // Enter learning mode
+        startLearningMode();
+      } else if (ch == 'N' || ch == 'n') {
+        // Next/advance learning mode (simulate button press)
+        if (g_learningPhase != LEARN_NONE && g_learningPhase != LEARN_COMPLETE) {
+          Serial.println(F("\n*** SERIAL COMMAND: Advancing learning phase ***"));
+          handleLearningButtonPress();
+        } else if (g_learningPhase == LEARN_NONE) {
+          Serial.println(F("Not in learning mode. Send 'L' first."));
+        } else {
+          Serial.println(F("Learning already complete."));
+        }
+      } else if (ch == 'T' || ch == 't') {
+        g_acsTestResult = runAcsSelfTest(true);
+      } else if (ch == 'M' || ch == 'm') {
+        Serial.println(F("Moving servo to mid (1500 us)"));
+        moveServoUs(SERVO_US_MID);
+      } else if (ch == '[') {
+        trimEndpoint(true, -SERVO_TRIM_STEP_US);
+      } else if (ch == ']') {
+        trimEndpoint(true, SERVO_TRIM_STEP_US);
+      } else if (ch == '{') {
+        trimEndpoint(false, -SERVO_TRIM_STEP_US);
+      } else if (ch == '}') {
+        trimEndpoint(false, SERVO_TRIM_STEP_US);
+      } else if (ch == 'X' || ch == 'x') {
+        int t = g_openUs; g_openUs = g_closedUs; g_closedUs = t;
+        float f = g_minFeedback; g_minFeedback = g_maxFeedback; g_maxFeedback = f;
+        Serial.println(F("Swapped OPEN and CLOSED (not saved - send W to save)"));
+        printServoSettings();
+      } else if (ch == 'W' || ch == 'w') {
+        saveServoToEEPROM();
+      } else if (ch == 'P' || ch == 'p') {
+        printServoSettings();
+      } else if (ch == 'H' || ch == 'h' || ch == '?') {
+        printCommands();
+      } else if (ch == 'A' || ch == 'a') {
+        if (runServoAutoSetup()) runFullCalibration();
+      }
+    }
+    // Buffer digits for numeric input
+    else if (isdigit(ch) && g_serialIdx < sizeof(g_serialBuffer) - 1) {
+      g_serialBuffer[g_serialIdx++] = ch;
+    }
+  }
+
+  // Handle learning mode processing (if active)
+  if (g_learningPhase != LEARN_NONE) {
+    processLearningPhase();
+    return;  // Skip normal operation when in learning mode
+  }
+
+  // Update LED pattern (handles all LED states now)
+  updateLEDPattern();
+
+  // Update built-in LED breathing effect (RP2040 only)
+  #ifdef BOARD_RP2040
+    if (g_systemOn) {  // Only breathe when system is active
+      updateBuiltinLEDBreathing();
+    } else {
+      neopixel.setPixelColor(0, 0);  // Turn off in standby
+      neopixel.show();
+    }
+  #endif
+
+  // Skip all monitoring when in standby mode
+  if (!g_systemOn) {
+    delay(100);
+    return;
+  }
+
+  // Only update and display every 5 seconds
+  if (now - g_lastUpdateMs >= 5000) {
+    g_lastUpdateMs = now;
+
+    // Measure current
+    float Irms = measureIrmsOver(SAMPLE_MS);
+
+    // Add to rolling average buffer
+    addSampleToRollingAvg(Irms);
+
+    // Calculate rolling average
+    float rollingAvgIrms = getRollingAverage();
+
+    // Determine fan state (informational only - may not be accurate)
+    // Uses global g_fanOn variable with hysteresis
+    if (Irms >= FAN_ON_THRESHOLD) {
+      g_fanOn = true;
+    } else if (Irms <= FAN_OFF_THRESHOLD) {
+      g_fanOn = false;
+    }
+
+    // Determine heater state (informational only - may not distinguish low heat from fan)
+    // Uses global g_heaterOn variable with hysteresis
+    if (Irms >= HEATER_ON_THRESHOLD) {
+      g_heaterOn = true;
+    } else if (Irms <= HEATER_OFF_THRESHOLD) {
+      g_heaterOn = false;
+    }
+
+    // Simple activity detection (use this for vent control)
+    // Uses global g_systemActive variable with hysteresis
+    if (Irms >= ACTIVITY_THRESHOLD) {
+      g_systemActive = true;
+    } else if (Irms <= IDLE_THRESHOLD) {
+      g_systemActive = false;
+    }
+
+    // Vent control logic based on heater and fan state
+    // Debug: show state before decision
+    Serial.print(F("DEBUG: heaterOn="));
+    Serial.print(g_heaterOn);
+    Serial.print(F(" fanOn="));
+    Serial.print(g_fanOn);
+    Serial.print(F(" g_ventOpen="));
+    Serial.print(g_ventOpen);
+    Serial.print(F(" Irms="));
+    Serial.println(Irms, 4);
+
+    if (g_heaterOn && !g_ventOpen) {
+      // Heater is ON and vent is closed - open it, cancel any pending close
+      g_ventClosePending = false;
+      Serial.println(F(">>> HEATER ON - Opening vent"));
+      openVent();
+      g_ventOpen = true;
+    } else if (!g_heaterOn && !g_fanOn && g_ventOpen) {
+      // Both heater AND fan are OFF - close immediately
+      Serial.println(F(">>> HEATER & FAN OFF - Closing vent immediately"));
+      closeVent();
+      g_ventOpen = false;
+      g_ventClosePending = false;
+    } else if (!g_heaterOn && g_heaterWasOn && g_fanOn && g_ventOpen) {
+      // Heater just turned OFF but fan still running - start delay timer
+      g_ventCloseDelayStart = now;
+      g_ventClosePending = true;
+      Serial.println(F(">>> HEATER OFF, FAN ON - Vent close in 3min"));
+    }
+    g_heaterWasOn = g_heaterOn;
+
+    // Check if pending close delay has expired (fan still running case)
+    if (g_ventClosePending && !g_heaterOn && g_fanOn) {
+      uint32_t elapsed = now - g_ventCloseDelayStart;
+      if (elapsed >= VENT_CLOSE_DELAY_MS) {
+        Serial.println(F("DELAY EXPIRED - Closing vent"));
+        closeVent();
+        g_ventOpen = false;
+        g_ventClosePending = false;
+      }
+    }
+
+    // Display debug information - throttled to once every 5 seconds
+    if (now - g_lastDebugOutputMs >= 5000) {
+      g_lastDebugOutputMs = now;
+
+      float rawV = readVolts(ADS_CH_CURRENT);
+      Serial.print(now / 1000);
+      Serial.print(F("s | Offset: "));
+      Serial.print(g_voltageOffset, 4);
+      Serial.print(F("V | Raw: "));
+      Serial.print(rawV, 4);
+      Serial.print(F("V | Irms: "));
+      Serial.print(Irms, 4);
+      Serial.print(F("A | Avg: "));
+      Serial.print(rollingAvgIrms, 4);
+      Serial.print(F("A ("));
+      Serial.print(g_sampleCount);
+      Serial.print(F("/"));
+      Serial.print(MAX_SAMPLES);
+      Serial.print(F(") | Fan: "));
+      Serial.print(g_fanOn ? F("ON ") : F("OFF"));
+      Serial.print(F(" | Heat: "));
+      Serial.print(g_heaterOn ? F("ON ") : F("OFF"));
+      Serial.print(F(" | Vent: "));
+      Serial.print(g_ventOpen ? F("OPEN") : F("CLOSED"));
+      if (g_ventClosePending) {
+        uint32_t remaining = (VENT_CLOSE_DELAY_MS - (now - g_ventCloseDelayStart)) / 1000;
+        Serial.print(F(" ("));
+        Serial.print(remaining);
+        Serial.print(F("s)"));
+      }
+      Serial.println();
+      Serial.flush();  // Ensure serial buffer is emptied to prevent overflow
+    }
+  }
+
+  // Small delay to prevent tight looping
+  delay(100);
+}

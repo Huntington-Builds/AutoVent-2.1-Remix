@@ -1,211 +1,75 @@
-# SUNLU AMS Heater Auto-Vent Controller
+# AutoVent 2.1 Remix for the SUNLU AMS Heater
 
-An intelligent, automatic vent controller for SUNLU AMS 3D printer filament dryers. It monitors AC current draw to detect heater and fan states, then drives a servo-operated vent to manage moisture removal, temperature, and energy consumption — all without any manual intervention.
+Firmware for the AutoVent 2.1 remix: a rotary vent cover driven by a 107-tooth sector gear off the original 24T servo gear (about 4.5:1), with a self-calibrating FEETECH FS90-FB feedback servo.
 
-## How It Works
+This is a fork of [Kevin G's AutoVent 2.0](https://github.com/kgregg384/SUNLU_AMS_Heater_AutoVent). The heater and fan detection, learning mode, 3-minute fan delay, standby and button behavior are his and are unchanged. Only the servo control was rewritten for the rotary cover.
 
-The controller uses a hall-effect current sensor (ACS758) to non-invasively monitor your dryer's power consumption. A 16-bit ADC (ADS1115) provides precise current measurements, allowing the system to distinguish between three states:
+- **Printable files and build guide:** MakerWorld, AutoVent 2.1 Remix by Huntington Builds
+- **Original design:** [AutoVent 2.0 on MakerWorld](https://makerworld.com/en/models/2344707-autovent-2-0-for-sunlu-ams-heater)
+- **Electronics, PCBs and DIY kits:** [3dcreator.shop](https://3dcreator.shop)
 
-- **Heater + Fan running** — vent opens immediately
-- **Fan only** — vent stays open for cooling
-- **Idle** — vent closes after a 3-minute cooldown delay
+## Files
 
-A self-learning calibration mode lets the controller adapt to your specific dryer model by measuring the actual current signatures.
+| File | What it is |
+|---|---|
+| `firmware/AutoVent_v4_RP2040_2.2.1.uf2` | Ready-to-flash firmware for the Seeed XIAO RP2040 |
+| `AutoVent_v4/AutoVent_v4.ino` | Source for v2.2.1 (open the `AutoVent_v4` folder in the Arduino IDE) |
 
-## Features
-
-- **Automatic operation** — no manual vent management needed
-- **Self-learning calibration** — adapts to any compatible dryer
-- **Non-volatile storage** — learned thresholds survive power cycles
-- **Servo position feedback** — closed-loop vent positioning
-- **Dual board support** — works with Seeed XIAO SAMD21 or RP2040
-- **Single-button interface** — short/long/very-long press for different functions
-- **LED status indication** — see what the controller is doing at a glance
-- **Serial debug console** — full diagnostic output and manual control commands
-- **Serial Monitor app** — GUI tool with color-coded output, quick command buttons, and remote learning mode
-- **Pre-built UF2 firmware** — flash without compiling using drag-and-drop
+Kevin's original files are left in place. The `.uf2` files without `v4` in the name are for his slider version, not this remix.
 
 ## Hardware
 
-### Components
+- Seeed XIAO RP2040
+- AutoVent PCB with ACS758 current sensor and ADS1115 ADC ([3dcreator.shop](https://3dcreator.shop))
+- FEETECH FS90-FB feedback servo (must be the 4-wire feedback version)
+- Illuminated momentary push button
+- 5 V, 2 A power supply
 
-| Component | Model | Purpose |
-|-----------|-------|---------|
-| Microcontroller | Seeed XIAO SAMD21 **or** RP2040 | Main controller (identical pinout) |
-| Current Sensor | ACS758 LCB-050B | AC current measurement (±50A) |
-| ADC | ADS1115 | 16-bit I2C analog-to-digital converter |
-| Servo | Feedback-enabled servo | Vent actuation with position feedback |
-| PCB | Custom (from [3dcreator.shop](https://3dcreator.shop)) | Bare board or kit with components |
+Pins are unchanged from the original: D0 servo, D3 button, D10 LED, SDA/SCL to the ADS1115 (A0 current sensor, A1 servo feedback).
 
-You'll also need a momentary push button, an LED with resistor, a USB-C cable, and a 5V 1A+ power source.
+## Flashing the firmware
 
-### Pin Configuration
+You need a computer and a USB-C data cable. No software to install.
 
-| Pin | Function | Notes |
-|-----|----------|-------|
-| D0 | Servo PWM | Output |
-| D3 | Button | Input, active low, internal pullup |
-| D10 | Status LED | Active low |
-| SDA/SCL | I2C | ADS1115 @ address 0x48 |
+1. Unplug the 5 V barrel jack so the board is only powered from USB.
+2. Remove the lid so you can reach the XIAO.
+3. Hold the small **B** (BOOT) button on the XIAO, plug the USB-C cable into your computer, then release **B**. If the cable is already plugged in: hold **B**, tap **R** (RESET), then release **B**.
+4. A drive named **RPI-RP2** appears on your computer.
+5. Drag `AutoVent_v4_RP2040_2.2.1.uf2` onto the RPI-RP2 drive. The board reboots on its own and the drive disappears. That means it worked.
+6. Unplug USB, reinstall the lid, and plug the 5 V supply back in.
 
-ADS1115 channels: A0 = current sensor, A1 = servo feedback.
+If RPI-RP2 doesn't show up, try a different cable. Many USB-C cables are charge-only.
 
-### 3D Printed Parts
+## Servo self-calibration (no computer needed)
 
-STL files for the vent mechanism and mounting hardware are available at MakerWorld. Approximate print time: ~4 hours.
-  - V1: https://makerworld.com/en/models/2038244-sunlu-ams-heater-autovent#profileId-2198796
-  - V2: https://makerworld.com/en/models/2344707-autovent-2-0-for-sunlu-ams-heater#profileId-2563439
+Runs automatically on the first boot after flashing. To run it again later, hold the button while plugging in the 5 V supply.
 
-## Getting Started
+1. The servo moves to its midpoint and the light flashes fast. Turn the vent cover halfway between its two stops, press the 24T gear on (or leave it if it is already installed), then press the button.
+2. The light flashes slowly while the servo finds both slot stops using the feedback wire. Keep hands clear.
+3. The servo moves to the end it thinks is OPEN and the light double-blinks.
+   - Vent is open: short press to accept.
+   - Vent is closed: hold the button 2 s until the light goes solid, then release. It swaps ends and asks again.
+4. The vent closes, the light gives 2 quick flashes, and the endpoints are saved.
 
-### Prerequisites
+If the light flashes fast for about 5 seconds, calibration failed. Reinstall the gear with the cover halfway between the stops and run it again.
 
-- [Arduino IDE](https://www.arduino.cc/ide) or [PlatformIO](https://platformio.org/)
-- Board package for your XIAO variant:
-  - **SAMD21**: Seeed SAMD Boards
-  - **RP2040**: Seeed RP2040 Boards (via [Earle Philhower's core](https://github.com/earlephilhower/arduino-pico))
-- Required libraries:
-  - `Adafruit ADS1X15`
-  - `Servo`
-  - `Wire`
-  - `FlashStorage` (SAMD21) or `EEPROM` (RP2040)
+## Button (normal use, unchanged from the original)
 
-### Upload Firmware
+| Press | Action |
+|---|---|
+| Short press | Recalibrate |
+| Hold 2 s | Standby on / off |
+| Hold 5 s | Current-threshold learning mode |
 
-**Option A: Pre-built UF2 (no Arduino IDE needed)**
+## What changed from the original firmware (v4 servo layer)
 
-1. Enter bootloader mode:
-   - **RP2040**: Hold the BOOT button while connecting USB-C. A drive named `RPI-RP2` will appear.
-   - **SAMD21**: Double-tap the reset pads. A drive named `Arduino` will appear.
-2. Drag and drop the appropriate UF2 file onto the drive:
-
-   | File | Board | Design |
-   |------|-------|--------|
-   | `SUNLU_AMS_Heater_AutoVent_RP2040_v1.uf2` | RP2040 | v1 |
-   | `SUNLU_AMS_Heater_AutoVent_RP2040_v2.uf2` | RP2040 | v2 |
-   | `SUNLU_AMS_Heater_AutoVent_SAMD21_v1.uf2` | SAMD21 | v1 |
-   | `SUNLU_AMS_Heater_AutoVent_SAMD21_v2.uf2` | SAMD21 | v2 |
-
-   The v1 and v2 versions correspond to different 3D printed designs that drive the vent from opposite sides, reversing the servo travel direction. Choose the file that matches your board and printed parts.
-3. The board reboots automatically and starts running
-
-**Option B: Compile from source (SAMD21 or RP2040)**
-
-1. Install the [Arduino IDE](https://www.arduino.cc/ide)
-2. Add the Seeed board package:
-   - Go to **File > Preferences**
-   - Add this URL to **Additional Board Manager URLs**:
-     - SAMD21: `https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json`
-     - RP2040: `https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json`
-   - Go to **Tools > Board > Board Manager**, search for "Seeed" or "RP2040", and install
-3. Install required libraries via **Tools > Manage Libraries**:
-   - `Adafruit ADS1X15`
-   - `FlashStorage` (SAMD21 only)
-4. Connect your XIAO board via USB-C
-5. Select the correct board under **Tools > Board**:
-   - SAMD21: **Seeeduino XIAO**
-   - RP2040: **Seeed XIAO RP2040**
-6. Select the correct port under **Tools > Port**
-7. Open `SUNLU_AMS_Heater_AutoVent.ino` and click **Upload**
-
-The firmware automatically detects which board it's running on at compile time — no configuration needed.
-
-### First-Time Setup
-
-1. Assemble the PCB and 3D printed parts, mount onto your dryer
-2. Connect AC power to the AutoVent and USB-C power to the controller
-3. Wait for the LED to go solid. Normal startup calibration takes about 10 seconds; the very first startup also finds the vent's stops and saves the servo travel limits, which adds roughly 20–30 seconds (see [Servo Setup](#servo-setup))
-4. Run **Learning Mode** to teach the controller your dryer's current signature:
-   - Ensure dryer is OFF
-   - Hold the button for 6–7 seconds to enter learning mode
-   - Follow the LED prompts through 3 measurement phases (~45 seconds total)
-   - Settings are saved automatically
-
-See the [User Guide](USER_GUIDE.md) for detailed step-by-step instructions.
-
-## Button Controls
-
-| Press Duration | Action |
-|---------------|--------|
-| < 2 seconds | Recalibrate servo |
-| 2–5 seconds | Toggle standby mode |
-| > 5 seconds | Enter learning mode |
-
-## LED Patterns
-
-| Pattern | Meaning |
-|---------|---------|
-| Solid | Normal operation / waiting for input |
-| Off | Standby mode |
-| Slow flash | Servo calibrating |
-| Fast flash | Measuring (learning mode) or servo setup in progress |
-| Double blink | Servo not set up — vent won't move until limits are set (send `A`) |
-| 3 long blinks | Learning complete |
-
-## Serial Monitor App
-
-A dedicated GUI serial monitor is included in the `SerialMonitor/` folder. It provides color-coded output, quick command buttons, auto-detection of the board, and the ability to run the full learning mode remotely without pressing the physical button.
-
-See the **[Serial Monitor Setup Guide](SerialMonitor/README.md)** for installation and usage instructions.
-
-## Serial Debug
-
-You can also use any serial terminal at 115200 baud. Available commands:
-
-| Command | Action |
-|---------|--------|
-| `O` / `o` | Open vent |
-| `C` / `c` | Close vent |
-| `R` / `r` | Recalibrate servo |
-| `F` / `f` | Read servo feedback |
-| `S` / `s` | Toggle standby |
-| `L` / `l` | Enter learning mode |
-| `0`–`180` | Move servo to angle |
-| `A` / `a` | Servo setup — find the stops automatically |
-| `?` | Show the command menu |
-| `J` / `j` | Servo setup — jog by hand to find the stops |
-
-### Servo Setup
-
-On first startup (or any calibration with no saved limits) the controller runs **Auto Find** and saves the result. After that, startup and recalibration only move between the saved limits and never drive the servo into the stops. You can redo or override the limits from the console at any time. If automatic setup fails, the LED double-blinks, the status line shows `SERVO NOT SET UP`, and the vent won't move until you set the limits with `A` or `J`.
-
-**Automatic:** send `A`. The servo moves to mid-travel, measures how the feedback follows it, then creeps toward each end until the feedback stops following (the vent hit a stop). Each limit is pulled in from its stop by about 13% of the measured travel (about 16° on a typical unit). Type either angle and press Enter to check it, then send `W` to save.
-
-**By hand:** send `J`, step with `+`/`-` (1°) or `>`/`<` (5°) until the vent stops moving (a warning prints when the feedback stops following), back off about 10–15°, and send `C` to mark CLOSED. Repeat at the other end with `O`, then send `W`.
-
-`Q` exits without saving, and `D` deletes the saved limits (the next calibration runs Auto Find again). Limits are stored in flash and survive power cycles. Automatic vent control and the button are paused during setup.
-
-## Documentation
-
-- **[User Guide](USER_GUIDE.md)** — Setup, operation, troubleshooting, and maintenance
-- **[Technical Specification](TECHNICAL_SPECIFICATION.md)** — Algorithms, timing, hardware details, and architecture
-
-## Project Structure
-
-```
-SUNLU_AMS_Heater_AutoVent.ino             # Main firmware (SAMD21 + RP2040)
-SUNLU_AMS_Heater_AutoVent_RP2040_v1.uf2   # Pre-built UF2 — RP2040, v1 design
-SUNLU_AMS_Heater_AutoVent_RP2040_v2.uf2   # Pre-built UF2 — RP2040, v2 design
-SUNLU_AMS_Heater_AutoVent_SAMD21_v1.uf2   # Pre-built UF2 — SAMD21, v1 design
-SUNLU_AMS_Heater_AutoVent_SAMD21_v2.uf2   # Pre-built UF2 — SAMD21, v2 design
-SerialMonitor/                             # GUI serial monitor app (Python/tkinter)
-  serial_monitor.py                        #   Main application
-  requirements.txt                         #   Python dependencies
-  install_dependencies.bat                 #   Windows dependency installer
-  build_windows_exe.bat                    #   Build standalone .exe
-  test_imports.py                          #   Dependency verification script
-USER_GUIDE.md                              # End-user documentation
-TECHNICAL_SPECIFICATION.md                 # Technical reference
-```
-
-## PCBs and Kits
-
-Custom PCBs (bare boards and assembled kits) are available from **[3dcreator.shop](https://3dcreator.shop)**.
+- Servo pulses limited to the FS90 rating (900–2100 µs); nothing outside is ever sent.
+- Open and closed are stored as pulse widths and saved to flash.
+- Moves ramp to the target, settle, then detach (no holding torque, like the original).
+- Calibration moves only between the configured endpoints instead of driving to 0/180°, which stalled against the mechanism.
+- After each move the feedback wire is checked; a miss is reported as a possible bind.
+- New serial commands: `M` (mid), `[` `]` (trim open), `{` `}` (trim closed), `X` (swap), `W` (save endpoints), `P` (print servo settings), `A` (self-calibrate), `H` or `?` (help).
 
 ## License
 
-MIT
-
-## Contributing
-
-Issues and pull requests are welcome. If you've adapted this for a different dryer model, feel free to share your experience.
+MIT, same as the original. Original work by Kevin G; v4 servo changes by Huntington Builds.
